@@ -1,0 +1,4 @@
+interface:
+  display_name: "KubeSphere IAM/RBAC"
+  short_description: "Test KubeSphere auth, roles, and extension API access"
+  default_prompt: "Use $kubesphere-iam-rbac to get KubeSphere user tokens, inspect RoleTemplates, bind roles, and verify extension API access through ks-apiserver."
