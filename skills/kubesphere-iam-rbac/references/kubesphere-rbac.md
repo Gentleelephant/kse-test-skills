@@ -244,6 +244,22 @@ kubectl --context "$CONTEXT" -n "$NAMESPACE" get roles.iam.kubesphere.io viewer 
 
 ## Authentication
 
+For many KubeSphere test environments, the admin account commonly uses a shared test password supplied by the user in the current task context:
+
+```text
+username: admin
+password: <redacted>
+```
+
+Use that password only when the user has explicitly provided it for the target test environment. Do not print it in final reports, committed files, or shared logs. Prefer passing it through an environment variable or an interactive password prompt.
+
+With the bundled helper:
+
+```bash
+KS_ADMIN_PASSWORD='<redacted>'
+python3 scripts/ks_admin.py login --server "$SERVER" --username admin --password "$KS_ADMIN_PASSWORD"
+```
+
 OAuth password grant, common on KubeSphere 3.x/4.x:
 
 ```bash

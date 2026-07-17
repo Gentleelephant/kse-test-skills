@@ -11,7 +11,7 @@ Use this skill to operate KubeSphere authentication, role binding, and extension
 
 ## Workflow
 
-1. Collect the target `--server` URL, username/password or existing `--token`, and the KubeSphere version if known.
+1. Collect the target `--server` URL, username/password or existing `--token`, and the KubeSphere version if known. When an admin token is needed in a test environment and the user has provided a default admin test password in the current task context, try username `admin` with that password.
 2. If the request involves testing an extension API, collect or read the API doc and infer API group, version, resource, scope, verbs, and ks-apiserver path templates.
 3. Read `references/kubesphere-rbac.md` when API details, RoleTemplate aggregation, role scope, or expected status codes are unclear.
 4. Prefer `scripts/ks_admin.py` for repeatable operations:
@@ -78,7 +78,7 @@ Expected decisions must be `ALLOW`, `DENY`, or `UNKNOWN`. Treat `UNKNOWN` as `PA
 
 - Treat authentication and RBAC changes as live administrative actions. Confirm the exact target server and scope before writing.
 - Use least privilege by default. Prefer namespace or workspace roles over cluster or platform roles when they satisfy the goal.
-- Do not log plaintext passwords or tokens. Prefer environment variables or interactive prompts.
+- Do not log plaintext passwords or tokens. Prefer environment variables or interactive prompts. Treat default admin test passwords as sensitive: they may be used to obtain a token in test environments, but final reports and persisted logs must show them as `<redacted>`.
 - Do not assume role names. List roles first when the role name is not provided or may differ by installation.
 - Do not guess API authorization expectations from role names alone. Read RoleTemplate resources and actual aggregated roles before judging an API result.
 - Call extension APIs through ks-apiserver unless the user or API doc explicitly says to call a backend service directly.
