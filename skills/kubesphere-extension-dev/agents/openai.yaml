@@ -1,0 +1,4 @@
+interface:
+  display_name: "KubeSphere Extension Dev"
+  short_description: "Develop and test KubeSphere extensions"
+  default_prompt: "Use $kubesphere-extension-dev to inspect, develop, package, publish, or troubleshoot a KubeSphere extension."
