@@ -74,6 +74,14 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(actual["verb"], "get")
         self.assertEqual(actual["scope"], "namespace")
 
+    def test_infer_static_get_operation_from_operation_id(self) -> None:
+        actual = e2e.infer_api(
+            "/kapis/example.io/v1/scheduling-policy",
+            {"operationId": "GetSchedulingPolicy", "tags": ["scheduling-policy"]},
+            "get",
+        )
+        self.assertEqual(actual["verb"], "get")
+
     def test_roletemplate_permissions_follow_scope_and_aggregation(self) -> None:
         templates = [
             roletemplate(
@@ -98,6 +106,72 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(e2e.expected_allow(templates, "workspace-viewer", create_operation)[0])
         self.assertTrue(e2e.expected_allow(templates, "workspace-admin", create_operation)[0])
         self.assertFalse(e2e.expected_allow(templates, "cluster-admin", create_operation)[0])
+
+    def test_roletemplate_scope_must_match_request_scope(self) -> None:
+        template = roletemplate(
+            "workspace-view-widgets",
+            "workspace",
+            ["iam.kubesphere.io/aggregate-to-viewer"],
+            ["list"],
+        )
+        operation = {
+            "group": "example.io",
+            "resource": "widgets",
+            "verb": "list",
+            "scope": "cluster",
+        }
+        self.assertFalse(e2e.expected_allow([template], "workspace-viewer", operation)[0])
+
+    def test_parent_role_scope_applies_to_descendant_request_scope(self) -> None:
+        cluster_template = roletemplate(
+            "cluster-view-widgets",
+            "cluster",
+            ["iam.kubesphere.io/aggregate-to-cluster-viewer"],
+            ["list"],
+        )
+        workspace_template = roletemplate(
+            "workspace-view-widgets",
+            "workspace",
+            ["iam.kubesphere.io/aggregate-to-viewer"],
+            ["list"],
+        )
+        namespace_operation = {
+            "group": "example.io",
+            "resource": "widgets",
+            "verb": "list",
+            "scope": "namespace",
+        }
+        self.assertTrue(e2e.expected_allow([cluster_template], "cluster-viewer", namespace_operation)[0])
+        self.assertTrue(e2e.expected_allow([workspace_template], "workspace-viewer", namespace_operation)[0])
+
+    def test_operation_key_is_unique_when_openapi_ids_are_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            document = root / "openapi.json"
+            document.write_text(
+                json.dumps(
+                    {
+                        "openapi": "3.0.0",
+                        "paths": {
+                            "/kapis/example.io/v1/widgets": {
+                                "get": {"operationId": "func1", "tags": ["widgets"]}
+                            },
+                            "/kapis/example.io/v1/gadgets": {
+                                "get": {"operationId": "func1", "tags": ["gadgets"]}
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = {
+                "spec": {
+                    "sources": {"apiDocs": [{"path": "./openapi.json"}]},
+                    "routing": {"pathOverrides": {}},
+                }
+            }
+            operations = e2e.load_operations(root / "kse-e2e.yaml", config)
+            self.assertEqual(len({item["operationKey"] for item in operations}), 2)
 
     def test_authenticated_template_applies_to_unprivileged_user(self) -> None:
         template = roletemplate(
@@ -132,6 +206,32 @@ class RunnerTests(unittest.TestCase):
             {"admin-secret", "provider-secret"},
         )
 
+    def test_public_value_matching_secret_does_not_corrupt_api_group(self) -> None:
+        config = {
+            "spec": {
+                "auth": {
+                    "oauthClientID": "kubesphere",
+                    "oauthClientSecret": "kubesphere",
+                }
+            }
+        }
+        value = {
+            "oauthClientSecret": "kubesphere",
+            "group": "volcano.kubesphere.io",
+        }
+        redacted = e2e.redact(value, e2e.secret_values(config))
+        self.assertEqual(redacted["oauthClientSecret"], "<redacted>")
+        self.assertEqual(redacted["group"], "volcano.kubesphere.io")
+
+    def test_authorization_verdict_is_not_treated_as_header_secret(self) -> None:
+        value = {
+            "expect": {"authorization": "ALLOW"},
+            "headers": {"Authorization": "Bearer abc.def.ghi"},
+        }
+        redacted = e2e.redact(value)
+        self.assertEqual(redacted["expect"]["authorization"], "ALLOW")
+        self.assertEqual(redacted["headers"]["Authorization"], "<redacted>")
+
     def test_user_creation_error_redacts_generated_password(self) -> None:
         client = mock.Mock()
         client.request.return_value = e2e.HTTPResponse(
@@ -149,6 +249,17 @@ class RunnerTests(unittest.TestCase):
                 ["generated-password"],
             )
         self.assertNotIn("generated-password", str(raised.exception))
+
+    def test_role_binding_names_remain_unique_after_sanitizing(self) -> None:
+        client = mock.Mock()
+        client.request.return_value = e2e.HTTPResponse(201, "{}", {})
+        state = {"resources": []}
+        run_id = "volcano-apiserver-e2e-20260727103203-abcdef"
+        e2e.bind_test_role(client, state, "cluster-admin", "admin-user", "ws", "ns", run_id)
+        e2e.bind_test_role(client, state, "cluster-viewer", "viewer-user", "ws", "ns", run_id)
+        names = [call.args[2]["metadata"]["name"] for call in client.request.call_args_list]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(all(len(name) <= 40 for name in names))
 
     def test_token_has_priority_in_auto_mode(self) -> None:
         config = {
@@ -351,6 +462,23 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(e2e.check_assertions('{"items":["own"]}', fixture), "")
         self.assertIn("omit", e2e.check_assertions('{"items":["own","other"]}', fixture))
 
+    def test_collection_assertions_match_kubernetes_object_names(self) -> None:
+        fixture = {
+            "assertions": [
+                {"path": "items", "contains": "own"},
+                {"path": "items", "omits": "other"},
+            ]
+        }
+        body = '{"items":[{"metadata":{"name":"own"}}]}'
+        self.assertEqual(e2e.check_assertions(body, fixture), "")
+        self.assertIn(
+            "omit",
+            e2e.check_assertions(
+                '{"items":[{"metadata":{"name":"own"}},{"name":"other"}]}',
+                fixture,
+            ),
+        )
+
     def test_generic_scenario_captures_setup_value_and_registers_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -474,7 +602,12 @@ class RunnerTests(unittest.TestCase):
 
     def test_cleanup_runs_in_reverse_registration_order(self) -> None:
         admin = mock.Mock()
-        admin.request.return_value = e2e.HTTPResponse(204, "", {})
+        admin.request.side_effect = [
+            e2e.HTTPResponse(204, "", {}),
+            e2e.HTTPResponse(204, "", {}),
+            e2e.HTTPResponse(404, "", {}),
+            e2e.HTTPResponse(404, "", {}),
+        ]
         errors = e2e.cleanup_state(
             admin,
             {
@@ -487,7 +620,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(
             [call.args[:2] for call in admin.request.call_args_list],
-            [("DELETE", "/children/two"), ("DELETE", "/parents/one")],
+            [
+                ("DELETE", "/children/two"),
+                ("DELETE", "/parents/one"),
+                ("GET", "/children/two"),
+                ("GET", "/parents/one"),
+            ],
         )
 
     def test_tracked_secret_config_is_rejected(self) -> None:

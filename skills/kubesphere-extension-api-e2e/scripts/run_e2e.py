@@ -202,6 +202,7 @@ def require_private_config(path: Path) -> None:
 
 def secret_values(config: dict[str, Any]) -> list[str]:
     values: list[str] = []
+    public_values: set[str] = set()
 
     def collect(value: Any) -> None:
         if isinstance(value, dict):
@@ -211,29 +212,37 @@ def secret_values(config: dict[str, Any]) -> list[str]:
                     isinstance(item, str)
                     and item
                     and (
-                        normalized in SENSITIVE_KEYS
+                        sensitive_item(key, item)
                         or "password" in normalized
                         or "token" in normalized
                         or "secret" in normalized
-                        or "authorization" in normalized
                     )
                 ):
                     values.append(item)
                 else:
+                    if isinstance(item, str) and item:
+                        public_values.add(item)
                     collect(item)
         elif isinstance(value, list):
             for item in value:
                 collect(item)
 
     collect(config)
-    return values
+    return list(dict.fromkeys(item for item in values if item not in public_values))
+
+
+def sensitive_item(key: str, value: Any) -> bool:
+    normalized = key.lower()
+    if normalized == "authorization":
+        return isinstance(value, str) and value.upper() not in ("ALLOW", "DENY")
+    return normalized in SENSITIVE_KEYS
 
 
 def redact(value: Any, secrets_to_hide: list[str] | None = None) -> Any:
     secrets_to_hide = [item for item in (secrets_to_hide or []) if item]
     if isinstance(value, dict):
         return {
-            key: ("<redacted>" if key.lower() in SENSITIVE_KEYS and item else redact(item, secrets_to_hide))
+            key: ("<redacted>" if sensitive_item(key, item) and item else redact(item, secrets_to_hide))
             for key, item in value.items()
         }
     if isinstance(value, list):
@@ -950,7 +959,13 @@ def infer_api(path: str, operation: dict[str, Any], method: str) -> dict[str, st
     verb = VERBS.get(method, "")
     if method == "get":
         placeholders = re.findall(r"{([^}]+)}", clean)
-        verb = "get" if placeholders and placeholders[-1] not in ("workspace", "namespace", "cluster", "resources") else "list"
+        operation_id = str(operation.get("operationId", "")).lower()
+        verb = (
+            "get"
+            if (placeholders and placeholders[-1] not in ("workspace", "namespace", "cluster", "resources"))
+            or operation_id.startswith("get")
+            else "list"
+        )
     return {"group": group, "version": version, "resource": resource, "verb": verb, "scope": scope}
 
 
@@ -975,6 +990,7 @@ def load_operations(path: Path, config: dict[str, Any]) -> list[dict[str, Any]]:
                 operations.append(
                     {
                         "operationId": operation.get("operationId") or f"{method.upper()} {resolved_path}",
+                        "operationKey": f"{method.upper()} {resolved_path}",
                         "summary": operation.get("summary", ""),
                         "method": method.upper(),
                         "path": resolved_path,
@@ -1033,8 +1049,21 @@ def rule_matches(rule: dict[str, Any], operation: dict[str, Any]) -> bool:
 
 def expected_allow(templates: list[dict[str, Any]], role: str, operation: dict[str, Any]) -> tuple[bool, list[str]]:
     names: list[str] = []
+    scope_children = {
+        "cluster": {"cluster", "workspace", "namespace"},
+        "workspace": {"workspace", "namespace"},
+        "namespace": {"namespace"},
+    }
     for template in templates:
         if not template_applies(template, role):
+            continue
+        template_scope = str(nested(template, "metadata", "labels", "iam.kubesphere.io/scope", default=""))
+        operation_scope = str(operation.get("scope", ""))
+        if (
+            operation_scope
+            and template_scope not in ("", "global")
+            and operation_scope not in scope_children.get(template_scope, {template_scope})
+        ):
             continue
         rules = nested(template, "spec", "rules", default=[]) or []
         if any(rule_matches(rule, operation) for rule in rules if isinstance(rule, dict)):
@@ -1065,6 +1094,7 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                 {
                     "role": role,
                     "operationId": operation["operationId"],
+                    "operationKey": operation["operationKey"],
                     "method": operation["method"],
                     "path": operation["path"],
                     "sar": {key: operation[key] for key in ("group", "version", "resource", "verb", "scope")},
@@ -1352,7 +1382,10 @@ def bind_test_role(
         return
     role_name = role
     kind = path = ""
-    metadata: dict[str, Any] = {"name": sanitize_name(f"{run_id}-{role}"), "labels": {RUN_LABEL: run_id}}
+    metadata: dict[str, Any] = {
+        "name": sanitize_name(f"{run_id[-16:]}-{role}-binding"),
+        "labels": {RUN_LABEL: run_id},
+    }
     if role.startswith("cluster-"):
         kind, path = "ClusterRoleBinding", "/apis/iam.kubesphere.io/v1beta1/clusterrolebindings"
         role_kind = "ClusterRole"
@@ -1601,6 +1634,10 @@ def compare_aggregations(
             str(nested(template, "metadata", "name", default=""))
             for template in templates
             if template_applies(template, role)
+            and (
+                role == "authenticated"
+                or nested(template, "metadata", "labels", "iam.kubesphere.io/scope", default="") != "global"
+            )
         )
         response = admin.request("GET", path)
         actual: list[str] = []
@@ -1660,11 +1697,25 @@ def check_assertions(body: str, fixture: dict[str, Any] | None) -> str:
             return f"response assertion {assertion['path']} expected {assertion['equals']!r}, got {actual!r}"
         if "contains" in assertion:
             expected = assertion["contains"]
-            if not isinstance(actual, (list, str, dict)) or expected not in actual:
+            contains = expected in actual if isinstance(actual, (list, str, dict)) else False
+            if isinstance(actual, list) and not contains:
+                contains = any(
+                    isinstance(item, dict)
+                    and expected in (item.get("name"), nested(item, "metadata", "name", default=None))
+                    for item in actual
+                )
+            if not contains:
                 return f"response assertion {assertion['path']} expected to contain {expected!r}"
         if "omits" in assertion:
             unexpected = assertion["omits"]
-            if isinstance(actual, (list, str, dict)) and unexpected in actual:
+            contains = unexpected in actual if isinstance(actual, (list, str, dict)) else False
+            if isinstance(actual, list) and not contains:
+                contains = any(
+                    isinstance(item, dict)
+                    and unexpected in (item.get("name"), nested(item, "metadata", "name", default=None))
+                    for item in actual
+                )
+            if contains:
                 return f"response assertion {assertion['path']} expected to omit {unexpected!r}"
     return ""
 
@@ -1937,10 +1988,10 @@ def execute_matrix(
 ) -> list[dict[str, Any]]:
     fixtures = load_scenarios(config_path, config)
     variables = {**state["variables"], **{str(k): str(v) for k, v in (fixtures.get("variables", {}) or {}).items()}}
-    operation_by_id = {item["operationId"]: item for item in plan["operations"]}
+    operation_by_key = {item["operationKey"]: item for item in plan["operations"]}
     results: list[dict[str, Any]] = []
     for row in plan["matrix"]:
-        operation = operation_by_id[row["operationId"]]
+        operation = operation_by_key[row["operationKey"]]
         fixture = fixture_for(fixtures, operation)
         row_variables = {
             **variables,
@@ -2010,8 +2061,9 @@ def execute_matrix(
     return results
 
 
-def cleanup_state(admin: Client, state: dict[str, Any]) -> list[str]:
+def cleanup_state(admin: Client, state: dict[str, Any], timeout: float = 30) -> list[str]:
     errors: list[str] = []
+    pending: set[str] = set()
     for item in reversed(state.get("resources", [])):
         path = item.get("path", "")
         if not path:
@@ -2021,8 +2073,21 @@ def cleanup_state(admin: Client, state: dict[str, Any]) -> list[str]:
             response = admin.request(method, path)
             if response.status not in (200, 202, 204, 404):
                 errors.append(f"{method} {path}: HTTP {response.status}: {summarize(response.body)}")
+            elif method == "DELETE" and response.status != 404:
+                pending.add(path)
         except E2EError as exc:
             errors.append(str(exc))
+    deadline = time.monotonic() + timeout
+    while pending and time.monotonic() < deadline:
+        for path in sorted(pending):
+            try:
+                if admin.request("GET", path).status == 404:
+                    pending.remove(path)
+            except E2EError:
+                pass
+        if pending:
+            time.sleep(0.5)
+    errors.extend(f"DELETE {path}: object still exists after {timeout:g}s" for path in sorted(pending))
     return errors
 
 
