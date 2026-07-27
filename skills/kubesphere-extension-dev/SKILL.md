@@ -30,7 +30,9 @@ ksbuilder template /path/to/extension --dry-run=client
 6. For test-cluster publishing, use `ksbuilder publish <extension-dir-or-package> --kubeconfig <path>` and verify the resulting extension resources, workloads, services, and ConfigMaps in the target cluster.
 7. For KubeSphere Cloud / Marketplace submission, use `ksbuilder login`, then `ksbuilder push <extension-dir-or-package>`, then `ksbuilder list` or `ksbuilder get <name>`. Do not confuse Cloud `push` with cluster `publish`.
 8. For cluster rollback, use `ksbuilder unpublish <extension-name>` against the same target kubeconfig and verify resources are removed.
-9. If the task becomes an IAM/RBAC access-control test for extension APIs, use `$kubesphere-iam-rbac` for token, RoleTemplate, role-binding, and ks-apiserver permission verification.
+9. If the task becomes a complete multi-role extension API test, use
+   `$kubesphere-extension-api-e2e`. Use `$kubesphere-iam-rbac` only for a
+   one-off login, RoleTemplate, binding, or 401/403 investigation.
 
 ## What To Check
 

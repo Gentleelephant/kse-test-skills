@@ -1,0 +1,63 @@
+apiVersion: testing.kubesphere.io/v1alpha1
+kind: ExtensionAPIE2E
+metadata:
+  name: extension-api-e2e
+spec:
+  target:
+    ksAPIServer: http://127.0.0.1:30880
+    cluster: host
+    tls:
+      insecureSkipVerify: false
+  auth:
+    mode: auto
+    adminUsername: admin
+    adminPassword: ""
+    adminToken: ""
+    loginPath: /oauth/token
+    oauthClientID: kubesphere
+    oauthClientSecret: kubesphere
+  sources:
+    apiDocs:
+      - path: ./apidocs.json
+        format: auto
+    extension:
+      path: .
+      renderer: auto
+      valuesFiles: []
+      releaseName: extension-api-e2e
+      namespace: extension-system
+      # Optional; auto-derived from extension.yaml.kubeVersion when omitted.
+      kubeVersion: ""
+  discovery:
+    extensionName: ""
+    roleTemplateSelector: {}
+  routing:
+    mode: auto
+    pathOverrides: {}
+  roles:
+    mode: auto
+    include:
+      - authenticated
+      - cluster-admin
+      - cluster-viewer
+      - workspace-admin
+      - workspace-viewer
+      - namespace-admin
+      - namespace-operator
+      - namespace-viewer
+      - no-permission
+      - no-token
+  fixtures:
+    file: ""
+  execution:
+    resourcePrefix: extension-e2e
+    timeout: 10m
+    roleAggregationWait: 30s
+    cleanup: always
+    tenants:
+      workspaces: 2
+      namespacesPerWorkspace: 1
+  report:
+    directory: ./test-results
+    json: kse-e2e-report.json
+    markdown: kse-e2e-report.md

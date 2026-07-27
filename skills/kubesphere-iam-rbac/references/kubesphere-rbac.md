@@ -1,5 +1,9 @@
 # KubeSphere IAM/RBAC Reference
 
+For a complete multi-role extension API E2E, use
+`$kubesphere-extension-api-e2e`. This reference remains the source for
+individual IAM operations and authorization diagnosis.
+
 ## Core Model
 
 - KubeSphere extension APIs are normally called through `ks-apiserver`. Do not call an extension backend workload directly unless the API doc explicitly requires it.

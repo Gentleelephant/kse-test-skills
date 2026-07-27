@@ -1,6 +1,6 @@
 ---
 name: kubesphere-iam-rbac
-description: Authenticate to KubeSphere and test IAM/RBAC workflows. Use when Codex needs to get a KubeSphere bearer token from username/password, inspect ks-apiserver APIs, read RoleTemplate permissions, create or update KubeSphere users, list roles, grant platform/cluster/workspace/namespace roles, or verify whether extension API access matches the designed permissions.
+description: Authenticate to KubeSphere and operate or diagnose individual IAM/RBAC workflows. Use when Codex needs to get a bearer token, inspect ks-apiserver IAM APIs, read RoleTemplates or one aggregated role, create a user, grant one platform/cluster/workspace/namespace role, call one API, or investigate a specific 401/403. Use kubesphere-extension-api-e2e instead for a complete temporary-environment, multi-role extension API matrix.
 ---
 
 # KubeSphere IAM/RBAC
@@ -28,52 +28,28 @@ python3 scripts/ks_admin.py bind-role --server https://ks.example.com --token "$
 python3 scripts/ks_admin.py api-call --server https://ks.example.com --token "$KS_TOKEN" --path /apis/example.io/v1/namespaces/demo/widgets --expect-status 200
 ```
 
-5. For API access-control tests, derive expected permissions from RoleTemplate resources first, then bind or reuse users that represent those roles, get each user's token, call the API through ks-apiserver, and compare actual HTTP status with the derived expectation.
+5. For a focused API access-control check, derive the expected permission from
+   RoleTemplate resources first, then bind or reuse the selected user, obtain
+   its token, call the API through ks-apiserver, and compare the response.
+   For a complete role matrix with temporary tenants, fixtures, reports, and
+   cleanup, hand off to `$kubesphere-extension-api-e2e`.
 6. For one-off investigation, use `login` first, then query discovery endpoints with `curl -H "Authorization: Bearer $KS_TOKEN"`. If login fails, rerun with `--diagnose` and inspect only the sanitized HTTP status, path, and response shape.
 7. Verify every write by reading the created user, role binding, or test API object after the operation.
-8. Finish with the standard result report format below. Do not invent a different report shape for each test.
+8. Finish with the focused result format below.
 
-## Standard Result Report
+## Focused Result
 
-Every access-control test must end with a concise report in this order:
+For a single IAM operation or authorization diagnosis, report:
 
 1. `Conclusion`: one of `PASS`, `FAIL`, `PARTIAL`, or `BLOCKED`.
-2. `Scope`: target environment, KubeSphere version when known, ks-apiserver URL, extension/API under test, cluster/workspace/namespace, and test time.
-3. `Evidence Sources`: API doc used, RoleTemplates inspected, aggregated roles inspected, users and bindings used, and discovery endpoints checked.
-4. `Permission Matrix`: expected permissions derived from RoleTemplates and actual role aggregation.
-5. `Interface Results`: one block or row per API interface, summarizing whether that interface passed, whether actual behavior matched the expected permissions, and the confidence level.
-6. `API Results`: one row per role/user/API call with method, path, expected decision, expected HTTP status, actual HTTP status, and result.
-7. `Mismatches`: only the failed or suspicious rows, with likely cause and next check.
-8. `Reproduce`: sanitized commands or script invocations. Never include plaintext passwords or bearer tokens.
+2. `Target`: sanitized ks-apiserver, cluster/workspace/namespace, user, and role.
+3. `Expected`: RoleTemplate rule and aggregated role evidence.
+4. `Actual`: operation, path, status, and sanitized response summary.
+5. `Diagnosis`: likely failure layer and next check.
+6. `Reproduce`: sanitized command with credentials referenced indirectly.
 
-Use these result meanings:
-
-- `PASS`: all tested API calls matched the RoleTemplate-derived expectation.
-- `FAIL`: at least one tested API call contradicts the expected authorization behavior.
-- `PARTIAL`: some checks passed, but coverage is incomplete or a non-authority issue such as `404` prevents a final authorization judgment for part of the matrix.
-- `BLOCKED`: testing could not produce meaningful authorization evidence, for example no valid token, no API doc, no reachable ks-apiserver, or missing permission to read RoleTemplates.
-
-For `Permission Matrix`, prefer this table shape:
-
-```text
-Role/Binding | Source RoleTemplate | Aggregated Role Checked | Resource | Verbs Expected Allow | Verbs Expected Deny | Notes
-```
-
-For `API Results`, prefer this table shape:
-
-```text
-Role/User | Method | Path | Expected | Expected HTTP | Actual HTTP | Result | Notes
-```
-
-For `Interface Results`, prefer this table shape:
-
-```text
-Interface | Method(s) | Resource/Path | Tested Roles | Expected Summary | Actual Summary | Result | Confidence | Notes
-```
-
-`Interface Results` is mandatory when the user provides API documentation or asks to test specific interfaces. Each documented interface must appear as `PASS`, `FAIL`, `PARTIAL`, or `NOT_TESTED`; do not hide untested interfaces.
-
-Expected decisions must be `ALLOW`, `DENY`, or `UNKNOWN`. Treat `UNKNOWN` as `PARTIAL` unless the user explicitly asked for exploratory discovery only.
+Do not use this focused format for a complete API document or role matrix;
+hand that work to `$kubesphere-extension-api-e2e`.
 
 ## Safety Rules
 
