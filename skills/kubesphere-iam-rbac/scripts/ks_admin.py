@@ -125,27 +125,73 @@ def urlencode(value: Any) -> str:
     return urllib.parse.urlencode(value)
 
 
+def is_token_like(value: str) -> bool:
+    return bool(value) and value.count(".") == 2
+
+
 def extract_token(payload: Any) -> str | None:
-    if isinstance(payload, str) and payload:
+    if isinstance(payload, str) and is_token_like(payload):
         return payload
     if not isinstance(payload, dict):
+        if isinstance(payload, list):
+            for item in payload:
+                token = extract_token(item)
+                if token:
+                    return token
         return None
     for key in ("access_token", "token", "accessToken"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             return value
-    data = payload.get("data")
-    if isinstance(data, dict):
-        return extract_token(data)
+    for value in payload.values():
+        if isinstance(value, (dict, list)):
+            token = extract_token(value)
+            if token:
+                return token
     return None
 
 
-def login(args: argparse.Namespace) -> None:
-    password = args.password or getpass.getpass("KubeSphere password: ")
-    client = Client(args.server, insecure=args.insecure)
-    attempts = [
-        (
-            "/oauth/token",
+def parse_response(raw: str) -> Any:
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def response_shape(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return {"kind": "json", "keys": sorted(str(key) for key in payload.keys())}
+    if isinstance(payload, list):
+        return {"kind": "json-list", "items": len(payload)}
+    if isinstance(payload, str):
+        text = payload.strip()
+        shape = {"kind": "text", "length": len(payload)}
+        if text.lower().startswith("<!doctype html") or text.lower().startswith("<html"):
+            shape["hint"] = "response looks like HTML; --server may point to KubeSphere Console instead of ks-apiserver"
+        return shape
+    return {"kind": type(payload).__name__}
+
+
+def login_problem(status: int, payload: Any) -> str:
+    if status in (401, 403):
+        return "credentials, client_id/client_secret, or identity provider rejected the login"
+    if status == 404:
+        return "login path was not found; check --server and --login-path"
+    if status >= 500:
+        return "server-side error from KubeSphere or its gateway"
+    if isinstance(payload, str):
+        text = payload.strip().lower()
+        if text.startswith("<!doctype html") or text.startswith("<html"):
+            return "non-JSON HTML response; --server may point to KubeSphere Console instead of ks-apiserver"
+        return "non-JSON response; expected a JSON token response from ks-apiserver"
+    return "no bearer token found in response"
+
+
+def make_login_body(kind: str, args: argparse.Namespace, password: str) -> tuple[dict[str, str], str]:
+    if kind == "oauth":
+        return (
             {
                 "grant_type": "password",
                 "username": args.username,
@@ -154,24 +200,81 @@ def login(args: argparse.Namespace) -> None:
                 "client_secret": args.client_secret,
             },
             "application/x-www-form-urlencoded",
-        ),
-        (
-            "/kapis/iam.kubesphere.io/v1alpha2/login",
-            {"username": args.username, "password": password},
-            "application/json",
-        ),
-    ]
+        )
+    return ({"username": args.username, "password": password}, "application/json")
+
+
+def infer_login_kind(path: str, auth_mode: str) -> str:
+    if auth_mode in ("oauth", "iam-json"):
+        return "oauth" if auth_mode == "oauth" else "iam-json"
+    return "oauth" if "oauth" in path else "iam-json"
+
+
+def login_attempts(args: argparse.Namespace, password: str) -> list[tuple[str, dict[str, str], str, str]]:
+    paths: list[tuple[str, str]] = []
+    if args.login_path:
+        paths.append((args.login_path, infer_login_kind(args.login_path, args.auth_mode)))
+    if args.auth_mode in ("auto", "oauth"):
+        paths.append(("/oauth/token", "oauth"))
+    if args.auth_mode in ("auto", "iam-json"):
+        paths.append(("/kapis/iam.kubesphere.io/v1alpha2/login", "iam-json"))
+
+    attempts: list[tuple[str, dict[str, str], str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for path, kind in paths:
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        key = (normalized_path, kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        body, content_type = make_login_body(kind, args, password)
+        attempts.append((normalized_path, body, content_type, kind))
+    return attempts
+
+
+def login_diagnostic(path: str, kind: str, status: int | None, payload: Any = None, error: str | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {"path": path, "auth_mode": kind}
+    if status is not None:
+        result["status"] = status
+    if error:
+        result["error"] = error
+        return result
+    result["response"] = response_shape(payload)
+    result["token_found"] = bool(extract_token(payload))
+    if status is not None and (status >= 400 or not result["token_found"]):
+        result["hint"] = login_problem(status, payload)
+    return result
+
+
+def login(args: argparse.Namespace) -> None:
+    password = args.password or getpass.getpass("KubeSphere password: ")
+    client = Client(args.server, insecure=args.insecure)
+    attempts = login_attempts(args, password)
     errors: list[str] = []
-    for path, body, content_type in attempts:
+    diagnostics: list[dict[str, Any]] = []
+    for path, body, content_type, kind in attempts:
         try:
-            payload = client.request("POST", path, body, content_type)
+            status, raw = client.raw_request("POST", path, body, content_type)
+            payload = parse_response(raw)
+            diagnostics.append(login_diagnostic(path, kind, status, payload))
+            if status >= 400:
+                errors.append(f"{path}: HTTP {status}: {login_problem(status, payload)}")
+                continue
             token = extract_token(payload)
             if token:
+                if args.diagnose:
+                    print(json.dumps({"success": True, "attempts": diagnostics}, indent=2, sort_keys=True))
+                    return
                 print(token)
                 return
-            errors.append(f"{path}: no token in response")
+            errors.append(f"{path}: {login_problem(status, payload)}; response {response_shape(payload)}")
         except SystemExit as exc:
-            errors.append(str(exc))
+            message = str(exc)
+            diagnostics.append(login_diagnostic(path, kind, None, error=message))
+            errors.append(message)
+    if args.diagnose:
+        print(json.dumps({"success": False, "attempts": diagnostics}, indent=2, sort_keys=True))
+        return
     raise SystemExit("Login failed:\n" + "\n".join(errors))
 
 
@@ -342,6 +445,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--password")
     p.add_argument("--client-id", default="kubesphere")
     p.add_argument("--client-secret", default="kubesphere")
+    p.add_argument("--auth-mode", choices=["auto", "oauth", "iam-json"], default="auto")
+    p.add_argument("--login-path", help="Custom login path on ks-apiserver, for example /oauth/token")
+    p.add_argument("--diagnose", action="store_true", help="Print sanitized login diagnostics instead of a token")
     p.set_defaults(func=login)
 
     p = sub.add_parser("create-user", help="Create a KubeSphere user")

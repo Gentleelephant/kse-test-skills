@@ -258,9 +258,12 @@ With the bundled helper:
 ```bash
 KS_ADMIN_PASSWORD='<redacted>'
 python3 scripts/ks_admin.py login --server "$SERVER" --username admin --password "$KS_ADMIN_PASSWORD"
+python3 scripts/ks_admin.py login --server "$SERVER" --username admin --password "$KS_ADMIN_PASSWORD" --diagnose
 ```
 
-OAuth password grant, common on KubeSphere 3.x/4.x:
+`$SERVER` should be the `ks-apiserver` base URL. If the response shape is HTML, the URL may point to the KubeSphere Console instead of the API server.
+
+OAuth password grant, common on KubeSphere 3.x and the preferred first attempt:
 
 ```bash
 curl -sk -X POST "$SERVER/oauth/token" \
@@ -268,7 +271,7 @@ curl -sk -X POST "$SERVER/oauth/token" \
   -d "grant_type=password&username=$USERNAME&password=$PASSWORD&client_id=kubesphere&client_secret=kubesphere"
 ```
 
-KubeSphere IAM login fallback:
+KubeSphere IAM login fallback for older installations. KubeSphere/KSE 4.1 removed `iam.kubesphere.io/v1alpha2`, so a `404` here is expected on newer clusters and is not proof that the username/password is wrong:
 
 ```bash
 curl -sk -X POST "$SERVER/kapis/iam.kubesphere.io/v1alpha2/login" \
