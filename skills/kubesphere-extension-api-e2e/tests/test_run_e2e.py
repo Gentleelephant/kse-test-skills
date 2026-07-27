@@ -39,6 +39,12 @@ def roletemplate(name: str, scope: str, labels: list[str], verbs: list[str]) -> 
 
 
 class RunnerTests(unittest.TestCase):
+    def test_example_config_contains_no_credentials(self) -> None:
+        example = e2e.load_yaml(SCRIPT.parents[1] / "assets" / "kse-e2e.example.yaml")
+        auth = example["spec"]["auth"]
+        self.assertEqual(auth["adminPassword"], "")
+        self.assertEqual(auth["adminToken"], "")
+
     def test_infer_workspace_list_operation(self) -> None:
         actual = e2e.infer_api(
             "/kapis/example.io/v1/workspaces/{workspace}/widgets",
@@ -114,6 +120,18 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("abc.def.ghi", text)
         self.assertIn("<redacted>", text)
 
+    def test_secret_values_include_scenario_secrets(self) -> None:
+        config = {
+            "spec": {
+                "auth": {"adminPassword": "admin-secret"},
+                "scenarios": {"variables": {"providerSecret": "provider-secret"}},
+            }
+        }
+        self.assertEqual(
+            set(e2e.secret_values(config)),
+            {"admin-secret", "provider-secret"},
+        )
+
     def test_user_creation_error_redacts_generated_password(self) -> None:
         client = mock.Mock()
         client.request.return_value = e2e.HTTPResponse(
@@ -171,6 +189,8 @@ class RunnerTests(unittest.TestCase):
             project = Path(directory)
             (project / "extension.yaml").write_text("name: demo\nnamespace: demo-system\n", encoding="utf-8")
             (project / "apidocs.json").write_text('{"swagger":"2.0","paths":{}}', encoding="utf-8")
+            (project / "go.mod").write_text("module example.test/demo\n", encoding="utf-8")
+            (project / "pkg").mkdir()
             args = argparse.Namespace(
                 project=str(project),
                 force=False,
@@ -196,6 +216,76 @@ class RunnerTests(unittest.TestCase):
             loaded = e2e.load_yaml(config)
             self.assertEqual(loaded["spec"]["auth"]["adminPassword"], "test-password")
             self.assertEqual(loaded["spec"]["sources"]["apiDocs"][0]["path"], "./apidocs.json")
+            self.assertEqual(loaded["spec"]["sources"]["backendCode"][0]["language"], "go")
+            self.assertEqual(loaded["spec"]["sources"]["backendCode"][0]["path"], ".")
+
+    def test_backend_source_inventory_honors_include_and_exclude(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pkg").mkdir()
+            (root / "vendor").mkdir()
+            (root / "pkg" / "handler.go").write_text("package pkg\n", encoding="utf-8")
+            (root / "pkg" / "notes.md").write_text("not source\n", encoding="utf-8")
+            (root / "vendor" / "ignored.go").write_text("package ignored\n", encoding="utf-8")
+            config = {
+                "spec": {
+                    "sources": {
+                        "backendCode": [
+                            {
+                                "name": "demo",
+                                "path": ".",
+                                "language": "go",
+                                "include": ["./pkg", "./vendor"],
+                                "exclude": ["./vendor"],
+                            }
+                        ]
+                    }
+                }
+            }
+            inventory = e2e.source_inventory(root / "kse-e2e.yaml", config)
+            self.assertEqual(inventory[0]["files"], ["./pkg/handler.go"])
+
+    def test_scenario_dependencies_are_topologically_ordered(self) -> None:
+        scenarios = [
+            {"id": "child", "dependsOn": ["parent"]},
+            {"id": "parent"},
+        ]
+        self.assertEqual([item["id"] for item in e2e.order_scenarios(scenarios)], ["parent", "child"])
+
+    def test_scenario_dependency_cycle_is_rejected(self) -> None:
+        with self.assertRaises(e2e.E2EError):
+            e2e.order_scenarios(
+                [
+                    {"id": "one", "dependsOn": ["two"]},
+                    {"id": "two", "dependsOn": ["one"]},
+                ]
+            )
+
+    def test_unresolved_variables_find_nested_placeholders(self) -> None:
+        self.assertEqual(
+            e2e.unresolved_variables(
+                {"path": "/widgets/{name}", "body": {"parent": "${parent}"}}
+            ),
+            ["name", "parent"],
+        )
+
+    def test_source_evidence_requires_existing_file_and_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "handler.go"
+            source.write_text("package demo\n", encoding="utf-8")
+            errors = e2e.validate_evidence(
+                "scenario",
+                [{"type": "source", "reference": "./handler.go:1", "certainty": "confirmed"}],
+                root / "kse-e2e.yaml",
+            )
+            self.assertEqual(errors, [])
+            errors = e2e.validate_evidence(
+                "scenario",
+                [{"type": "source", "reference": "./missing.go", "certainty": "confirmed"}],
+                root / "kse-e2e.yaml",
+            )
+            self.assertTrue(errors)
 
     def test_write_without_fixture_is_not_executable(self) -> None:
         operation = {"method": "POST", "path": "/kapis/example.io/v1/widgets"}
@@ -251,6 +341,155 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(e2e.check_assertions('{"spec":{}}', fixture), "")
         self.assertIn("absent", e2e.check_assertions('{"spec":{"weight":1}}', fixture))
 
+    def test_collection_assertions_support_contains_and_omits(self) -> None:
+        fixture = {
+            "assertions": [
+                {"path": "items", "contains": "own"},
+                {"path": "items", "omits": "other"},
+            ]
+        }
+        self.assertEqual(e2e.check_assertions('{"items":["own"]}', fixture), "")
+        self.assertIn("omit", e2e.check_assertions('{"items":["own","other"]}', fixture))
+
+    def test_generic_scenario_captures_setup_value_and_registers_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "kse-e2e.yaml"
+            config = {
+                "spec": {
+                    "report": {"directory": "./test-results"},
+                    "scenarios": {"variables": {}, "overrides": [], "additional": []},
+                }
+            }
+            state = {
+                "runID": "run-1",
+                "variables": {"workspace": "ws"},
+                "resources": [],
+            }
+            admin = mock.Mock()
+            admin.request.return_value = e2e.HTTPResponse(201, '{"metadata":{"name":"created"}}', {})
+            actor = mock.Mock()
+            actor.request.return_value = e2e.HTTPResponse(200, '{"metadata":{"name":"created"}}', {})
+            plan = {
+                "scenarios": [
+                    {
+                        "id": "read-created",
+                        "actor": "workspace-admin",
+                        "setup": [
+                            {
+                                "actor": "admin",
+                                "method": "POST",
+                                "path": "/widgets",
+                                "capture": {"createdName": "metadata.name"},
+                                "cleanupPath": "/widgets/${createdName}",
+                            }
+                        ],
+                        "request": {"method": "GET", "path": "/widgets/${createdName}"},
+                        "authorization": {
+                            "group": "example.io",
+                            "version": "v1",
+                            "resource": "widgets",
+                            "verb": "get",
+                            "scope": "workspace",
+                        },
+                        "expect": {"authorization": "ALLOW", "statuses": [200]},
+                        "assertions": [{"path": "metadata.name", "equals": "created"}],
+                        "evidence": [
+                            {"type": "source", "reference": "./handler.go:1", "certainty": "confirmed"}
+                        ],
+                    }
+                ]
+            }
+            results = e2e.execute_scenarios(
+                plan,
+                config_path,
+                config,
+                state,
+                admin,
+                {"workspace-admin": actor},
+            )
+            self.assertEqual(results[0]["result"], "PASS")
+            actor.request.assert_called_once_with("GET", "/widgets/created", None, "application/json")
+            self.assertEqual(state["resources"][0]["path"], "/widgets/created")
+
+    def test_business_rejection_and_authorization_bypass_are_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "spec": {
+                    "report": {"directory": "./test-results"},
+                    "scenarios": {"variables": {}, "overrides": [], "additional": []},
+                }
+            }
+            state = {"runID": "run-1", "variables": {}, "resources": []}
+            actor = mock.Mock()
+            actor.request.side_effect = [
+                e2e.HTTPResponse(400, '{"message":"parent belongs to another workspace"}', {}),
+                e2e.HTTPResponse(200, '{"items":[]}', {}),
+            ]
+            base = {
+                "actor": "workspace-admin",
+                "authorization": {
+                    "group": "example.io",
+                    "version": "v1",
+                    "resource": "widgets",
+                    "verb": "create",
+                    "scope": "workspace",
+                },
+                "evidence": [
+                    {"type": "source", "reference": "./handler.go:1", "certainty": "confirmed"}
+                ],
+            }
+            plan = {
+                "scenarios": [
+                    {
+                        **base,
+                        "id": "business-rejection",
+                        "request": {"method": "POST", "path": "/widgets", "body": {}},
+                        "expect": {
+                            "authorization": "ALLOW",
+                            "statuses": [400],
+                            "errorContains": ["parent", "workspace"],
+                        },
+                    },
+                    {
+                        **base,
+                        "id": "must-be-forbidden",
+                        "request": {"method": "POST", "path": "/other/widgets", "body": {}},
+                        "expect": {"authorization": "DENY", "statuses": [403]},
+                    },
+                ]
+            }
+            results = e2e.execute_scenarios(
+                plan,
+                root / "kse-e2e.yaml",
+                config,
+                state,
+                mock.Mock(),
+                {"workspace-admin": actor},
+            )
+            self.assertEqual(results[0]["result"], "PASS")
+            self.assertEqual(results[1]["result"], "FAIL")
+            self.assertEqual(results[1]["likelyFailureLayer"], "authorization bypass")
+
+    def test_cleanup_runs_in_reverse_registration_order(self) -> None:
+        admin = mock.Mock()
+        admin.request.return_value = e2e.HTTPResponse(204, "", {})
+        errors = e2e.cleanup_state(
+            admin,
+            {
+                "resources": [
+                    {"method": "DELETE", "path": "/parents/one"},
+                    {"method": "DELETE", "path": "/children/two"},
+                ]
+            },
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [call.args[:2] for call in admin.request.call_args_list],
+            [("DELETE", "/children/two"), ("DELETE", "/parents/one")],
+        )
+
     def test_tracked_secret_config_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -265,6 +504,10 @@ class RunnerTests(unittest.TestCase):
     def test_conclusion_distinguishes_partial_and_fail(self) -> None:
         self.assertEqual(
             e2e.conclusion({"results": [{"result": "NOT_TESTED"}]}),
+            "PARTIAL",
+        )
+        self.assertEqual(
+            e2e.conclusion({"results": [{"result": "NEEDS_CONFIGURATION"}]}),
             "PARTIAL",
         )
         self.assertEqual(

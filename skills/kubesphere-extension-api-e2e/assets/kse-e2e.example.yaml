@@ -4,11 +4,13 @@ metadata:
   name: extension-api-e2e
 spec:
   target:
+    # KubeSphere ks-apiserver, not Console or the extension backend Service.
     ksAPIServer: http://127.0.0.1:30880
     cluster: host
     tls:
       insecureSkipVerify: false
   auth:
+    # auto prefers adminToken, otherwise username/password.
     mode: auto
     adminUsername: admin
     adminPassword: ""
@@ -26,8 +28,23 @@ spec:
       valuesFiles: []
       releaseName: extension-api-e2e
       namespace: extension-system
-      # Optional; auto-derived from extension.yaml.kubeVersion when omitted.
       kubeVersion: ""
+    # The Agent reads these trees to derive routes, SAR attributes, business
+    # validation, resource dependencies, filtering, and error contracts.
+    backendCode:
+      - name: extension-backend
+        path: .
+        language: auto
+        include:
+          - ./cmd
+          - ./pkg
+          - ./internal
+        exclude:
+          - ./vendor
+          - ./node_modules
+          - ./test-results
+          - ./dist
+          - ./build
   discovery:
     extensionName: ""
     roleTemplateSelector: {}
@@ -47,8 +64,12 @@ spec:
       - namespace-viewer
       - no-permission
       - no-token
-  fixtures:
-    file: ""
+  scenarios:
+    # Values unavailable from API documents, charts, source, or runtime
+    # discovery belong here. This remains the only user-maintained file.
+    variables: {}
+    overrides: []
+    additional: []
   execution:
     resourcePrefix: extension-e2e
     timeout: 10m
@@ -59,5 +80,6 @@ spec:
       namespacesPerWorkspace: 1
   report:
     directory: ./test-results
+    plan: kse-e2e-plan.json
     json: kse-e2e-report.json
     markdown: kse-e2e-report.md

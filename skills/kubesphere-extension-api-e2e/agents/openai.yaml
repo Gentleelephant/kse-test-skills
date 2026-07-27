@@ -1,4 +1,4 @@
 interface:
   display_name: "KubeSphere Extension API E2E"
-  short_description: "Test KubeSphere extension APIs across built-in roles"
-  default_prompt: "Use $kubesphere-extension-api-e2e to initialize, plan, run, and diagnose a multi-role extension API E2E test."
+  short_description: "Derive extension E2E tests from docs, charts, and source"
+  default_prompt: "Use $kubesphere-extension-api-e2e to inspect this extension's API documents, charts, RoleTemplates, and configured backend source, then generate and run a complete multi-role E2E plan without calling project-specific E2E code."

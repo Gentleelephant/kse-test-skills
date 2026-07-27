@@ -58,6 +58,18 @@ SENSITIVE_KEYS = {
     "authorization",
     "client_secret",
 }
+LANGUAGE_MARKERS = {
+    "go": ("go.mod",),
+    "java": ("pom.xml", "build.gradle", "build.gradle.kts"),
+    "python": ("pyproject.toml", "requirements.txt", "setup.py"),
+    "node": ("package.json",),
+}
+SOURCE_SUFFIXES = {
+    "go": {".go"},
+    "java": {".java", ".kt"},
+    "python": {".py"},
+    "node": {".js", ".jsx", ".ts", ".tsx"},
+}
 
 
 class E2EError(RuntimeError):
@@ -189,12 +201,32 @@ def require_private_config(path: Path) -> None:
 
 
 def secret_values(config: dict[str, Any]) -> list[str]:
-    auth = nested(config, "spec", "auth", default={}) or {}
-    return [
-        str(auth.get(key, ""))
-        for key in ("adminPassword", "adminToken", "oauthClientSecret")
-        if auth.get(key)
-    ]
+    values: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = key.lower()
+                if (
+                    isinstance(item, str)
+                    and item
+                    and (
+                        normalized in SENSITIVE_KEYS
+                        or "password" in normalized
+                        or "token" in normalized
+                        or "secret" in normalized
+                        or "authorization" in normalized
+                    )
+                ):
+                    values.append(item)
+                else:
+                    collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(config)
+    return values
 
 
 def redact(value: Any, secrets_to_hide: list[str] | None = None) -> Any:
@@ -242,6 +274,98 @@ def relpath(path: Path, root: Path) -> str:
         return str(path.resolve())
 
 
+def detect_language(root: Path) -> str:
+    for language, markers in LANGUAGE_MARKERS.items():
+        if any((root / marker).is_file() for marker in markers):
+            return language
+    return "unknown"
+
+
+def discover_backend_code(project: Path) -> list[dict[str, Any]]:
+    language = detect_language(project)
+    if language == "unknown":
+        return []
+    include = [
+        f"./{name}"
+        for name in ("cmd", "pkg", "internal", "src", "app")
+        if (project / name).is_dir()
+    ]
+    return [
+        {
+            "name": sanitize_name(project.name, "backend"),
+            "path": ".",
+            "language": language,
+            "include": include,
+            "exclude": ["./vendor", "./node_modules", "./test-results", "./dist", "./build"],
+        }
+    ]
+
+
+def backend_sources(config_path: Path, config: dict[str, Any]) -> list[dict[str, Any]]:
+    configured = nested(config, "spec", "sources", "backendCode", default=[]) or []
+    if not isinstance(configured, list):
+        raise E2EError("spec.sources.backendCode must be a list")
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(configured):
+        if not isinstance(item, dict):
+            raise E2EError(f"spec.sources.backendCode[{index}] must be an object")
+        raw_path = str(item.get("path", "")).strip()
+        if not raw_path:
+            raise E2EError(f"spec.sources.backendCode[{index}].path is required")
+        root = resolve(config_path, raw_path)
+        language = str(item.get("language", "auto"))
+        if language == "auto":
+            language = detect_language(root)
+        result.append(
+            {
+                "name": str(item.get("name") or sanitize_name(root.name, f"backend-{index + 1}")),
+                "path": root,
+                "configuredPath": raw_path,
+                "language": language,
+                "include": item.get("include", []) or [],
+                "exclude": item.get("exclude", []) or [],
+            }
+        )
+    return result
+
+
+def source_inventory(config_path: Path, config: dict[str, Any]) -> list[dict[str, Any]]:
+    inventory: list[dict[str, Any]] = []
+    for source in backend_sources(config_path, config):
+        root = source["path"]
+        suffixes = SOURCE_SUFFIXES.get(source["language"], set())
+        includes = source["include"] or ["."]
+        excluded = [
+            (root / str(raw)).resolve()
+            for raw in source["exclude"]
+        ]
+        files: list[str] = []
+        for raw in includes:
+            candidate = (root / str(raw)).resolve()
+            if candidate.is_file():
+                candidates = [candidate]
+            elif candidate.is_dir():
+                candidates = (item for item in candidate.rglob("*") if item.is_file())
+            else:
+                continue
+            for item in candidates:
+                resolved = item.resolve()
+                if any(resolved == path or path in resolved.parents for path in excluded):
+                    continue
+                if suffixes and resolved.suffix.lower() not in suffixes:
+                    continue
+                files.append(relpath(resolved, config_path.parent))
+        inventory.append(
+            {
+                "name": source["name"],
+                "path": relpath(root, config_path.parent),
+                "language": source["language"],
+                "files": sorted(set(files)),
+            }
+        )
+    return inventory
+
+
 def prompt(label: str, default: str = "", secret: bool = False, non_interactive: bool = False) -> str:
     if non_interactive:
         return default
@@ -284,9 +408,20 @@ def init_config(args: argparse.Namespace) -> None:
         if chart_candidates
         else "."
     )
+    backend_code = discover_backend_code(project)
 
     extension_name = ""
     extension_file = resolve(output, extension) / "extension.yaml"
+    extension_root = resolve(output, extension)
+    values_files = [
+        relpath(candidate, project)
+        for candidate in (
+            extension_root / "values.yaml",
+            project / "values.yaml",
+        )
+        if candidate.is_file()
+    ]
+    values_files = list(dict.fromkeys(values_files))
     if extension_file.exists():
         extension_data = load_yaml(extension_file) or {}
         extension_name = str(extension_data.get("name", ""))
@@ -330,7 +465,7 @@ def init_config(args: argparse.Namespace) -> None:
                 "extension": {
                     "path": extension,
                     "renderer": "auto",
-                    "valuesFiles": [],
+                    "valuesFiles": values_files,
                     "releaseName": sanitize_name(extension_name or project.name),
                     "namespace": (extension_data.get("namespace") if extension_file.exists() else None)
                     or f"{sanitize_name(extension_name or project.name)}-system",
@@ -338,6 +473,7 @@ def init_config(args: argparse.Namespace) -> None:
                     if extension_file.exists()
                     else "",
                 },
+                "backendCode": backend_code,
             },
             "discovery": {
                 "extensionName": extension_name,
@@ -347,7 +483,7 @@ def init_config(args: argparse.Namespace) -> None:
             },
             "routing": {"mode": "auto", "pathOverrides": {}},
             "roles": {"mode": "auto", "include": DEFAULT_ROLES.copy()},
-            "fixtures": {"file": ""},
+            "scenarios": {"variables": {}, "overrides": [], "additional": []},
             "execution": {
                 "resourcePrefix": sanitize_name(extension_name or project.name) + "-e2e",
                 "timeout": "10m",
@@ -357,6 +493,7 @@ def init_config(args: argparse.Namespace) -> None:
             },
             "report": {
                 "directory": "./test-results",
+                "plan": "kse-e2e-plan.json",
                 "json": "kse-e2e-report.json",
                 "markdown": "kse-e2e-report.md",
             },
@@ -430,6 +567,26 @@ def validate_config_shape(path: Path, config: dict[str, Any]) -> list[str]:
         if not resolve(path, str(raw)).is_file():
             errors.append(f"values file does not exist: {raw}")
 
+    try:
+        sources = backend_sources(path, config)
+    except E2EError as exc:
+        errors.append(str(exc))
+        sources = []
+    if not sources:
+        errors.append("spec.sources.backendCode must contain at least one backend source")
+    for index, source in enumerate(sources):
+        root = source["path"]
+        if not root.is_dir():
+            errors.append(f"backend code path does not exist: {source['configuredPath']}")
+            continue
+        if source["language"] not in (*LANGUAGE_MARKERS, "unknown"):
+            errors.append(
+                f"spec.sources.backendCode[{index}].language must be auto, go, java, python, or node"
+            )
+        for field in ("include", "exclude"):
+            if not isinstance(source[field], list):
+                errors.append(f"spec.sources.backendCode[{index}].{field} must be a list")
+
     execution = nested(config, "spec", "execution", default={}) or {}
     try:
         duration_seconds(execution.get("timeout", "10m"), "spec.execution.timeout")
@@ -438,10 +595,134 @@ def validate_config_shape(path: Path, config: dict[str, Any]) -> list[str]:
         errors.append(str(exc))
     if execution.get("cleanup", "always") not in ("always", "never"):
         errors.append("spec.execution.cleanup must be always or never")
-    fixture = nested(config, "spec", "fixtures", "file", default="")
-    if fixture and not resolve(path, str(fixture)).is_file():
-        errors.append(f"fixture file does not exist: {fixture}")
+    scenarios = nested(config, "spec", "scenarios", default={}) or {}
+    if not isinstance(scenarios, dict):
+        errors.append("spec.scenarios must be an object")
+    else:
+        errors.extend(validate_scenarios(path, config, scenarios))
     return errors
+
+
+def validate_scenarios(path: Path, config: dict[str, Any], scenarios: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for field in ("overrides", "additional"):
+        if not isinstance(scenarios.get(field, []), list):
+            errors.append(f"spec.scenarios.{field} must be a list")
+    if not isinstance(scenarios.get("variables", {}), dict):
+        errors.append("spec.scenarios.variables must be an object")
+    overrides = scenarios.get("overrides", []) if isinstance(scenarios.get("overrides", []), list) else []
+    for index, override in enumerate(overrides):
+        prefix = f"spec.scenarios.overrides[{index}]"
+        if not isinstance(override, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        if not override.get("operationId") and not (override.get("method") and override.get("path")):
+            errors.append(f"{prefix} requires operationId or method and path")
+        errors.extend(validate_evidence(prefix, override.get("evidence", []), path))
+    additional = scenarios.get("additional", []) if isinstance(scenarios.get("additional", []), list) else []
+    identifiers: list[str] = []
+    roles = set(nested(config, "spec", "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES)
+    for index, scenario in enumerate(additional):
+        prefix = f"spec.scenarios.additional[{index}]"
+        if not isinstance(scenario, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        identifier = str(scenario.get("id", "")).strip()
+        if not identifier:
+            errors.append(f"{prefix}.id is required")
+        else:
+            identifiers.append(identifier)
+        status = str(scenario.get("status", "")).upper()
+        if status and status != "NEEDS_CONFIGURATION":
+            errors.append(f"{prefix}.status may only be NEEDS_CONFIGURATION")
+        actor = str(scenario.get("actor", ""))
+        if not status and actor not in roles:
+            errors.append(f"{prefix}.actor must be one of the configured roles")
+        request = scenario.get("request")
+        if not status and (
+            not isinstance(request, dict) or not request.get("method") or not request.get("path")
+        ):
+            errors.append(f"{prefix}.request requires method and path")
+        setup = scenario.get("setup", []) or []
+        if not isinstance(setup, list):
+            errors.append(f"{prefix}.setup must be a list")
+            setup = []
+        for step_index, step in enumerate(setup):
+            if not isinstance(step, dict) or not step.get("method") or not step.get("path"):
+                errors.append(f"{prefix}.setup[{step_index}] requires method and path")
+        dependencies = scenario.get("dependsOn", []) or []
+        if not isinstance(dependencies, list):
+            errors.append(f"{prefix}.dependsOn must be a list")
+        if not status and not isinstance(scenario.get("authorization"), dict):
+            errors.append(f"{prefix}.authorization is required")
+        if not status and not isinstance(scenario.get("expect"), dict):
+            errors.append(f"{prefix}.expect is required")
+        errors.extend(validate_evidence(prefix, scenario.get("evidence", []), path))
+    duplicates = sorted({item for item in identifiers if identifiers.count(item) > 1})
+    if duplicates:
+        errors.append("scenario IDs must be unique: " + ", ".join(duplicates))
+    known = set(identifiers)
+    for scenario in additional:
+        if not isinstance(scenario, dict):
+            continue
+        for dependency in scenario.get("dependsOn", []) or []:
+            if dependency not in known:
+                errors.append(f"scenario {scenario.get('id', '<unknown>')} depends on unknown scenario {dependency}")
+    try:
+        order_scenarios(additional)
+    except E2EError as exc:
+        errors.append(str(exc))
+    return errors
+
+
+def validate_evidence(prefix: str, evidence: Any, config_path: Path) -> list[str]:
+    if not isinstance(evidence, list) or not evidence:
+        return [f"{prefix}.evidence must contain at least one design source"]
+    errors: list[str] = []
+    for index, item in enumerate(evidence):
+        field = f"{prefix}.evidence[{index}]"
+        if not isinstance(item, dict) or not item.get("type") or not item.get("reference"):
+            errors.append(f"{field} requires type and reference")
+            continue
+        certainty = str(item.get("certainty", ""))
+        if certainty not in ("confirmed", "inferred", "runtime"):
+            errors.append(f"{field}.certainty must be confirmed, inferred, or runtime")
+        if item.get("type") == "source":
+            reference = str(item["reference"])
+            raw_path, separator, line = reference.rpartition(":")
+            if not separator or not line.isdigit():
+                errors.append(f"{field}.reference must use path:line for source evidence")
+            elif not resolve(config_path, raw_path).is_file():
+                errors.append(f"{field}.reference source does not exist: {raw_path}")
+    return errors
+
+
+def order_scenarios(scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id = {
+        str(item.get("id")): item
+        for item in scenarios
+        if isinstance(item, dict) and item.get("id")
+    }
+    ordered: list[dict[str, Any]] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(identifier: str) -> None:
+        if identifier in visited:
+            return
+        if identifier in visiting:
+            raise E2EError(f"scenario dependency cycle contains {identifier}")
+        visiting.add(identifier)
+        for dependency in by_id[identifier].get("dependsOn", []) or []:
+            if dependency in by_id:
+                visit(str(dependency))
+        visiting.remove(identifier)
+        visited.add(identifier)
+        ordered.append(by_id[identifier])
+
+    for identifier in by_id:
+        visit(identifier)
+    return ordered
 
 
 def choose_auth(config: dict[str, Any]) -> str:
@@ -764,15 +1045,17 @@ def expected_allow(templates: list[dict[str, Any]], role: str, operation: dict[s
 def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
     renderer, templates = render_roletemplates(path, config)
     operations = load_operations(path, config)
-    fixtures = load_fixtures(path, config)
+    scenarios = load_scenarios(path, config)
     for operation in operations:
-        fixture = fixture_for(fixtures, operation)
+        fixture = fixture_for(scenarios, operation)
         sar = fixture.get("sar", {}) if fixture else {}
         for key in ("group", "version", "resource", "verb", "scope"):
             if key in sar:
                 operation[key] = str(sar[key])
         if fixture and fixture.get("requestPath"):
             operation["requestPath"] = str(fixture["requestPath"])
+        if fixture and fixture.get("evidence"):
+            operation["evidence"] = fixture["evidence"]
     roles = nested(config, "spec", "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES
     matrix = []
     for operation in operations:
@@ -787,14 +1070,34 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                     "sar": {key: operation[key] for key in ("group", "version", "resource", "verb", "scope")},
                     "expected": "ALLOW" if allow else "DENY",
                     "roleTemplates": sources,
+                    "evidence": operation.get("evidence", []),
                 }
             )
+    needs_configuration = [
+        {
+            "operationId": operation["operationId"],
+            "reason": "write operation needs a valid request body in spec.scenarios.overrides",
+        }
+        for operation in operations
+        if operation["method"] != "GET" and fixture_for(scenarios, operation) is None
+    ]
+    needs_configuration.extend(
+        {
+            "scenario": scenario.get("id", ""),
+            "reason": scenario.get("reason", "scenario requires configuration"),
+        }
+        for scenario in scenarios["additional"]
+        if str(scenario.get("status", "")).upper() == "NEEDS_CONFIGURATION"
+    )
     return {
         "generatedAt": utc_now(),
         "renderer": renderer,
+        "backendSources": source_inventory(path, config),
         "roleTemplates": [roletemplate_summary(item) for item in templates],
         "operations": operations,
         "matrix": matrix,
+        "scenarios": order_scenarios(scenarios["additional"]),
+        "needsConfiguration": needs_configuration,
     }
 
 
@@ -813,6 +1116,15 @@ def sanitized_summary(config: dict[str, Any]) -> dict[str, Any]:
         "authenticationMode": choose_auth(config),
         "adminUsername": nested(config, "spec", "auth", "adminUsername", default=""),
         "roles": nested(config, "spec", "roles", "include", default=DEFAULT_ROLES),
+        "backendCode": [
+            {
+                "name": item.get("name", ""),
+                "path": item.get("path", ""),
+                "language": item.get("language", "auto"),
+            }
+            for item in (nested(config, "spec", "sources", "backendCode", default=[]) or [])
+            if isinstance(item, dict)
+        ],
         "cleanup": nested(config, "spec", "execution", "cleanup", default="always"),
     }
 
@@ -834,6 +1146,10 @@ def validate_command(args: argparse.Namespace) -> None:
     response = client.request("GET", "/apis/iam.kubesphere.io/v1beta1/roletemplates?limit=1")
     if response.status >= 400:
         raise E2EError(f"credential validation failed: HTTP {response.status} reading RoleTemplates")
+    api_service_checks = check_apiservices(client, operations)
+    failed_services = [item["name"] for item in api_service_checks if item["result"] != "PASS"]
+    if failed_services:
+        raise E2EError("APIService validation failed: " + ", ".join(failed_services))
     print(
         json.dumps(
             {
@@ -842,6 +1158,8 @@ def validate_command(args: argparse.Namespace) -> None:
                 "renderer": renderer,
                 "roleTemplates": len(templates),
                 "apiOperations": len(operations),
+                "apiServices": api_service_checks,
+                "backendSources": source_inventory(path, config),
                 "credentials": "valid",
             },
             indent=2,
@@ -856,9 +1174,14 @@ def plan_command(args: argparse.Namespace) -> None:
     if errors:
         raise E2EError("configuration validation failed:\n- " + "\n- ".join(errors))
     plan = build_plan(path, config)
-    output = Path(args.output).resolve() if args.output else path.parent / "test-results" / "kse-e2e-plan.json"
+    report_directory = resolve(path, nested(config, "spec", "report", "directory", default="./test-results"))
+    default_plan = report_directory / str(nested(config, "spec", "report", "plan", default="kse-e2e-plan.json"))
+    output = Path(args.output).resolve() if args.output else default_plan
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(redact(plan, secret_values(config)), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     print(json.dumps({"result": "PASS", "config": sanitized_summary(config), "plan": str(output), "rows": len(plan["matrix"])}, indent=2, ensure_ascii=False))
 
 
@@ -1096,20 +1419,32 @@ def substitute(value: Any, variables: dict[str, str]) -> Any:
     if isinstance(value, str):
         result = value
         for key, item in variables.items():
-            result = result.replace("${" + key + "}", item).replace("{" + key + "}", urllib.parse.quote(item, safe=""))
+            text = str(item)
+            result = result.replace("${" + key + "}", text).replace(
+                "{" + key + "}", urllib.parse.quote(text, safe="")
+            )
         return result
     return value
 
 
-def load_fixtures(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
+def load_scenarios(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
+    configured = nested(config, "spec", "scenarios", default={}) or {}
+    if not isinstance(configured, dict):
+        raise E2EError("spec.scenarios must be an object")
+    result = {
+        "variables": dict(configured.get("variables", {}) or {}),
+        "operations": list(configured.get("overrides", []) or []),
+        "additional": list(configured.get("additional", []) or []),
+    }
+    # Backward-compatible import for configurations created by the first release.
     raw = nested(config, "spec", "fixtures", "file", default="")
-    if not raw:
-        return {"variables": {}, "operations": []}
-    path = resolve(config_path, str(raw))
-    value = load_yaml(path)
-    if not isinstance(value, dict):
-        raise E2EError("fixture file must contain an object")
-    return value
+    if raw:
+        value = load_yaml(resolve(config_path, str(raw)))
+        if not isinstance(value, dict):
+            raise E2EError("fixture file must contain an object")
+        result["variables"] = {**(value.get("variables", {}) or {}), **result["variables"]}
+        result["operations"] = [*(value.get("operations", []) or []), *result["operations"]]
+    return result
 
 
 def fixture_for(fixtures: dict[str, Any], operation: dict[str, Any]) -> dict[str, Any] | None:
@@ -1204,6 +1539,33 @@ def compare_live_templates(admin: Client, config: dict[str, Any], source: list[d
     return checks
 
 
+def check_apiservices(admin: Client, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    identities = sorted(
+        {
+            (str(item.get("group", "")), str(item.get("version", "")))
+            for item in operations
+            if str(item.get("path", "")).startswith("/kapis/")
+            and item.get("group")
+            and item.get("version")
+        }
+    )
+    checks: list[dict[str, Any]] = []
+    for group, version in identities:
+        name = f"{version}.{group}"
+        path = f"/apis/extensions.kubesphere.io/v1alpha1/apiservices/{urllib.parse.quote(name, safe='')}"
+        response = admin.request("GET", path)
+        checks.append(
+            {
+                "name": name,
+                "path": path,
+                "actualStatus": response.status,
+                "result": "PASS" if response.status == 200 else "FAIL",
+                "message": "" if response.status == 200 else summarize(response.body),
+            }
+        )
+    return checks
+
+
 def roletemplate_equivalent(source: dict[str, Any], live: dict[str, Any] | None) -> bool:
     if not live or source.get("rules") != live.get("rules"):
         return False
@@ -1292,9 +1654,278 @@ def check_assertions(body: str, fixture: dict[str, Any] | None) -> str:
             return str(exc)
         if assertion.get("absent") is True:
             return f"response assertion {assertion['path']} expected the field to be absent"
+        if assertion.get("exists") is True:
+            continue
         if "equals" in assertion and actual != assertion["equals"]:
             return f"response assertion {assertion['path']} expected {assertion['equals']!r}, got {actual!r}"
+        if "contains" in assertion:
+            expected = assertion["contains"]
+            if not isinstance(actual, (list, str, dict)) or expected not in actual:
+                return f"response assertion {assertion['path']} expected to contain {expected!r}"
+        if "omits" in assertion:
+            unexpected = assertion["omits"]
+            if isinstance(actual, (list, str, dict)) and unexpected in actual:
+                return f"response assertion {assertion['path']} expected to omit {unexpected!r}"
     return ""
+
+
+def capture_values(body: str, capture: dict[str, Any], variables: dict[str, Any]) -> str:
+    if not capture:
+        return ""
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return "response capture requires a JSON response"
+    for name, raw_path in capture.items():
+        try:
+            variables[str(name)] = str(value_at_path(payload, str(raw_path)))
+        except E2EError as exc:
+            return str(exc)
+    return ""
+
+
+def unresolved_variables(value: Any) -> list[str]:
+    missing: set[str] = set()
+    if isinstance(value, dict):
+        for item in value.values():
+            missing.update(unresolved_variables(item))
+    elif isinstance(value, list):
+        for item in value:
+            missing.update(unresolved_variables(item))
+    elif isinstance(value, str):
+        for first, second in re.findall(r"\$\{([^}]+)}|{([^}]+)}", value):
+            missing.add(first or second)
+    return sorted(missing)
+
+
+def register_cleanup(state: dict[str, Any], cleanup: Any, variables: dict[str, Any]) -> None:
+    items = cleanup if isinstance(cleanup, list) else [cleanup]
+    for item in items:
+        if isinstance(item, str):
+            item = {"method": "DELETE", "path": item}
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        resolved = substitute(item, variables)
+        state["resources"].append(
+            {
+                "method": str(resolved.get("method", "DELETE")).upper(),
+                "path": str(resolved["path"]),
+            }
+        )
+
+
+def scenario_operation(scenario: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    authorization = scenario.get("authorization", {}) or {}
+    return {
+        "group": str(authorization.get("group", "")),
+        "version": str(authorization.get("version", "")),
+        "resource": str(authorization.get("resource", "")),
+        "verb": str(authorization.get("verb", VERBS.get(str(request.get("method", "")).lower(), ""))),
+        "scope": str(authorization.get("scope", "cluster")),
+    }
+
+
+def execute_scenarios(
+    plan: dict[str, Any],
+    config_path: Path,
+    config: dict[str, Any],
+    state: dict[str, Any],
+    admin: Client,
+    clients: dict[str, Client],
+) -> list[dict[str, Any]]:
+    configured = load_scenarios(config_path, config)
+    variables: dict[str, Any] = {**state["variables"], **configured["variables"]}
+    outcomes: dict[str, str] = {}
+    results: list[dict[str, Any]] = []
+    for raw in plan.get("scenarios", []):
+        scenario = substitute(raw, {str(key): str(value) for key, value in variables.items()})
+        identifier = str(scenario.get("id", ""))
+        result: dict[str, Any] = {
+            "scenario": identifier,
+            "role": scenario.get("actor", ""),
+            "evidence": scenario.get("evidence", []),
+            "functionalPassed": False,
+            "diagnosticPassed": True,
+            "passed": False,
+        }
+        if str(scenario.get("status", "")).upper() == "NEEDS_CONFIGURATION":
+            result.update(
+                {
+                    "result": "NEEDS_CONFIGURATION",
+                    "skipped": True,
+                    "skipReason": scenario.get("reason", "scenario requires configuration"),
+                }
+            )
+            outcomes[identifier] = result["result"]
+            results.append(result)
+            continue
+        failed_dependencies = [
+            dependency
+            for dependency in scenario.get("dependsOn", []) or []
+            if outcomes.get(str(dependency)) != "PASS"
+        ]
+        if failed_dependencies:
+            result.update(
+                {
+                    "result": "BLOCKED",
+                    "skipped": True,
+                    "skipReason": "dependency did not pass: " + ", ".join(failed_dependencies),
+                }
+            )
+            outcomes[identifier] = result["result"]
+            results.append(result)
+            continue
+        error = ""
+        needs_configuration = False
+        for raw_step in raw.get("setup", []) or []:
+            step = substitute(raw_step, {str(key): str(value) for key, value in variables.items()})
+            missing = unresolved_variables(
+                {
+                    key: step[key]
+                    for key in ("actor", "method", "path", "body", "contentType", "expectedStatuses")
+                    if key in step
+                }
+            )
+            if missing:
+                error = "missing scenario variables: " + ", ".join(missing)
+                needs_configuration = True
+                break
+            step_actor = str(step.get("actor", "admin"))
+            client = admin if step_actor == "admin" else clients.get(step_actor)
+            if client is None:
+                error = f"setup actor is unavailable: {step_actor}"
+                break
+            try:
+                response = client.request(
+                    str(step["method"]).upper(),
+                    str(step["path"]),
+                    step.get("body"),
+                    str(step.get("contentType", "application/json")),
+                )
+            except E2EError as exc:
+                error = str(exc)
+                break
+            expected_statuses = step.get("expectedStatuses", [200, 201, 202, 204])
+            if response.status not in expected_statuses:
+                error = f"setup {step['method']} {step['path']} returned HTTP {response.status}: {summarize(response.body)}"
+                break
+            error = capture_values(response.body, step.get("capture", {}) or {}, variables)
+            if error:
+                break
+            if step.get("cleanup"):
+                register_cleanup(state, step["cleanup"], variables)
+            elif step.get("cleanupPath"):
+                register_cleanup(state, str(step["cleanupPath"]), variables)
+            save_state(state_file(config_path, config, state["runID"]), state)
+        if error:
+            result.update(
+                {
+                    "result": "NEEDS_CONFIGURATION" if needs_configuration else "FAIL",
+                    "error": error,
+                    "likelyFailureLayer": "configuration" if needs_configuration else "scenario setup",
+                    "suggestion": (
+                        "add the named values to spec.scenarios.variables"
+                        if needs_configuration
+                        else "check setup dependencies, request bodies, and source-derived assumptions"
+                    ),
+                }
+            )
+            outcomes[identifier] = result["result"]
+            results.append(result)
+            continue
+        scenario = substitute(raw, {str(key): str(value) for key, value in variables.items()})
+        request = scenario["request"]
+        missing = unresolved_variables(request)
+        if missing:
+            result.update(
+                {
+                    "result": "NEEDS_CONFIGURATION",
+                    "skipped": True,
+                    "skipReason": "missing scenario variables: " + ", ".join(missing),
+                }
+            )
+            outcomes[identifier] = result["result"]
+            results.append(result)
+            continue
+        actor = str(scenario["actor"])
+        client = clients.get(actor)
+        if client is None:
+            result.update({"result": "BLOCKED", "error": f"test user client is unavailable: {actor}"})
+            outcomes[identifier] = result["result"]
+            results.append(result)
+            continue
+        started = time.monotonic()
+        try:
+            response = client.request(
+                str(request["method"]).upper(),
+                str(request["path"]),
+                request.get("body"),
+                str(request.get("contentType", "application/json")),
+            )
+        except E2EError as exc:
+            result.update(
+                {
+                    "method": str(request["method"]).upper(),
+                    "path": request["path"],
+                    "result": "FAIL",
+                    "error": str(exc),
+                    "likelyFailureLayer": "network/client",
+                    "suggestion": "check ks-apiserver URL, TLS, network, and APIService availability",
+                }
+            )
+            outcomes[identifier] = result["result"]
+            results.append(result)
+            continue
+        operation = scenario_operation(scenario, request)
+        expected = scenario.get("expect", {}) or {}
+        authorization = str(expected.get("authorization", "ALLOW")).upper()
+        statuses = expected.get("statuses")
+        if statuses:
+            functional = response.status in statuses
+        elif actor == "no-token":
+            functional = response.status in (401, 403)
+        elif authorization == "DENY":
+            functional = response.status == 403
+        else:
+            functional = 200 <= response.status < 300
+        assertion_error = check_assertions(response.body, scenario) if functional else ""
+        capture_error = capture_values(response.body, scenario.get("capture", {}) or {}, variables) if functional else ""
+        error = assertion_error or capture_error
+        functional = functional and not error
+        required_error_terms = [str(item).lower() for item in expected.get("errorContains", []) or []]
+        diagnostic = diagnostic_quality(actor, operation, response)
+        if required_error_terms:
+            diagnostic = all(term in response.body.lower() for term in required_error_terms)
+        layer, suggestion = diagnose(authorization, response, error, diagnostic)
+        if scenario.get("cleanup"):
+            register_cleanup(state, scenario["cleanup"], variables)
+            save_state(state_file(config_path, config, state["runID"]), state)
+        result.update(
+            {
+                "method": str(request["method"]).upper(),
+                "path": request["path"],
+                "sar": operation,
+                "expected": authorization,
+                "expectedStatuses": statuses or [],
+                "actualStatus": response.status,
+                "durationMs": round((time.monotonic() - started) * 1000),
+                "requestID": response.headers.get("Audit-Id")
+                or response.headers.get("X-Request-ID")
+                or response.headers.get("X-Trace-ID")
+                or "",
+                "response": summarize(response.body),
+                "functionalPassed": functional,
+                "diagnosticPassed": diagnostic,
+                "passed": functional and diagnostic,
+                "result": "PASS" if functional and diagnostic else "FAIL",
+                "error": error,
+                "likelyFailureLayer": "" if functional and diagnostic else layer,
+                "suggestion": "" if functional and diagnostic else suggestion,
+            }
+        )
+        outcomes[identifier] = result["result"]
+        results.append(result)
+    return results
 
 
 def execute_matrix(
@@ -1304,7 +1935,7 @@ def execute_matrix(
     state: dict[str, Any],
     clients: dict[str, Client],
 ) -> list[dict[str, Any]]:
-    fixtures = load_fixtures(config_path, config)
+    fixtures = load_scenarios(config_path, config)
     variables = {**state["variables"], **{str(k): str(v) for k, v in (fixtures.get("variables", {}) or {}).items()}}
     operation_by_id = {item["operationId"]: item for item in plan["operations"]}
     results: list[dict[str, Any]] = []
@@ -1386,9 +2017,10 @@ def cleanup_state(admin: Client, state: dict[str, Any]) -> list[str]:
         if not path:
             continue
         try:
-            response = admin.request("DELETE", path)
+            method = str(item.get("method", "DELETE")).upper()
+            response = admin.request(method, path)
             if response.status not in (200, 202, 204, 404):
-                errors.append(f"DELETE {path}: HTTP {response.status}: {summarize(response.body)}")
+                errors.append(f"{method} {path}: HTTP {response.status}: {summarize(response.body)}")
         except E2EError as exc:
             errors.append(str(exc))
     return errors
@@ -1406,10 +2038,14 @@ def conclusion(report: dict[str, Any]) -> str:
     if report.get("cleanupErrors"):
         return "FAIL"
     results = report.get("results", [])
-    evidence = report.get("roleTemplateChecks", []) + report.get("aggregationChecks", [])
+    evidence = (
+        report.get("apiServiceChecks", [])
+        + report.get("roleTemplateChecks", [])
+        + report.get("aggregationChecks", [])
+    )
     if any(item.get("result") == "FAIL" for item in results) or any(item.get("result") == "FAIL" for item in evidence):
         return "FAIL"
-    if any(item.get("result") in ("NOT_TESTED", "BLOCKED") for item in results):
+    if any(item.get("result") in ("NOT_TESTED", "NEEDS_CONFIGURATION", "BLOCKED") for item in results):
         return "PARTIAL"
     return "PASS"
 
@@ -1489,8 +2125,12 @@ def run_command(args: argparse.Namespace) -> None:
         )
         plan = build_plan(config_path, config)
         report["renderer"] = plan["renderer"]
+        report["backendSources"] = plan["backendSources"]
         report["operations"] = plan["operations"]
         report["permissionMatrix"] = plan["matrix"]
+        report["scenarios"] = plan["scenarios"]
+        report["needsConfiguration"] = plan["needsConfiguration"]
+        report["apiServiceChecks"] = check_apiservices(admin, plan["operations"])
         _, source_templates = render_roletemplates(config_path, config)
         report["roleTemplateChecks"] = compare_live_templates(admin, config, source_templates)
         state, clients = prepare_environment(config_path, config, admin, run_id)
@@ -1501,6 +2141,7 @@ def run_command(args: argparse.Namespace) -> None:
             nested(config, "spec", "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES,
         )
         report["results"] = execute_matrix(plan, config_path, config, state, clients)
+        report["results"].extend(execute_scenarios(plan, config_path, config, state, admin, clients))
     except (E2EError, OSError, ValueError) as exc:
         report["setupErrors"].append(str(redact(str(exc), secret_values(config))))
     finally:
