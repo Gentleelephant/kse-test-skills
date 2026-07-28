@@ -48,6 +48,9 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("spec", example)
         self.assertEqual(auth["adminPassword"], "")
         self.assertEqual(auth["adminToken"], "")
+        self.assertEqual(example["apiMappings"], {})
+        self.assertNotIn("backendCode", example["sources"])
+        self.assertNotIn("scenarios", example)
 
     def test_infer_workspace_list_operation(self) -> None:
         actual = e2e.infer_api(
@@ -55,16 +58,12 @@ class RunnerTests(unittest.TestCase):
             {"tags": ["widgets"]},
             "get",
         )
-        self.assertEqual(
-            actual,
-            {
-                "group": "example.io",
-                "version": "v1",
-                "resource": "widgets",
-                "verb": "list",
-                "scope": "workspace",
-            },
-        )
+        self.assertEqual(actual["group"], "example.io")
+        self.assertEqual(actual["version"], "v1")
+        self.assertEqual(actual["resource"], "widgets")
+        self.assertEqual(actual["verb"], "list")
+        self.assertEqual(actual["scope"], "workspace")
+        self.assertEqual(actual["mappingIssues"], [])
 
     def test_minimum_kube_version_from_extension_constraint(self) -> None:
         self.assertEqual(e2e.minimum_kube_version(">=1.21.0-0"), "1.21.0")
@@ -147,6 +146,21 @@ class RunnerTests(unittest.TestCase):
         }
         self.assertTrue(e2e.expected_allow([cluster_template], "cluster-viewer", namespace_operation)[0])
         self.assertTrue(e2e.expected_allow([workspace_template], "workspace-viewer", namespace_operation)[0])
+        self.assertTrue(
+            e2e.expected_allow(
+                [workspace_template], "workspace-viewer", namespace_operation, "sibling-namespace"
+            )[0]
+        )
+        self.assertFalse(
+            e2e.expected_allow(
+                [workspace_template], "workspace-viewer", namespace_operation, "other-workspace"
+            )[0]
+        )
+        self.assertFalse(
+            e2e.expected_allow(
+                [workspace_template], "namespace-viewer", namespace_operation, "sibling-namespace"
+            )[0]
+        )
 
     def test_operation_key_is_unique_when_openapi_ids_are_reused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -174,6 +188,40 @@ class RunnerTests(unittest.TestCase):
             }
             operations = e2e.load_operations(root / "kse-e2e.yaml", config)
             self.assertEqual(len({item["operationKey"] for item in operations}), 2)
+
+    def test_api_mapping_overrides_document_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "openapi.json").write_text(
+                json.dumps(
+                    {
+                        "paths": {
+                            "/kapis/example.io/v1/policy": {
+                                "get": {"operationId": "GetPolicy", "tags": ["wrong-tag"]}
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            operations = e2e.load_operations(
+                root / "kse-e2e.yaml",
+                {
+                    "sources": {"apiDocs": [{"path": "./openapi.json"}]},
+                    "apiMappings": {
+                        "GetPolicy": {
+                            "apiGroup": "example.io",
+                            "version": "v1",
+                            "resource": "policies",
+                            "verb": "list",
+                            "scope": "cluster",
+                        }
+                    },
+                },
+            )
+            self.assertEqual(operations[0]["resource"], "policies")
+            self.assertEqual(operations[0]["verb"], "list")
+            self.assertEqual(operations[0]["mappingSource"], "config")
 
     def test_authenticated_template_applies_to_unprivileged_user(self) -> None:
         template = roletemplate(
@@ -322,8 +370,9 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(loaded["schemaVersion"], 1)
             self.assertEqual(loaded["auth"]["adminPassword"], "test-password")
             self.assertEqual(loaded["sources"]["apiDocs"][0]["path"], "./apidocs.json")
-            self.assertEqual(loaded["sources"]["backendCode"][0]["language"], "go")
-            self.assertEqual(loaded["sources"]["backendCode"][0]["path"], ".")
+            self.assertNotIn("backendCode", loaded["sources"])
+            self.assertEqual(loaded["apiMappings"], {})
+            self.assertEqual(loaded["execution"]["membershipWait"], "30s")
             self.assertNotIn("spec", loaded)
 
     def test_load_config_rejects_kubernetes_style_schema(self) -> None:
@@ -611,6 +660,253 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(results[1]["result"], "FAIL")
             self.assertEqual(results[1]["likelyFailureLayer"], "authorization bypass")
 
+    def test_workspace_and_namespace_routes_expand_to_cross_scope_targets(self) -> None:
+        self.assertEqual(
+            e2e.operation_targets({"path": "/workspaces/{workspace}/widgets"}),
+            ["own", "other-workspace"],
+        )
+        self.assertEqual(
+            e2e.operation_targets({"path": "/namespaces/{namespace}/widgets"}),
+            ["own", "sibling-namespace", "other-workspace"],
+        )
+
+    def test_workspace_role_is_invited_through_member_api(self) -> None:
+        admin = mock.Mock()
+        admin.request.return_value = e2e.HTTPResponse(200, "[]", {})
+        state = {"resources": []}
+        result = e2e.invite_test_role(
+            admin,
+            state,
+            "workspace-viewer",
+            "test-user",
+            "workspace-a",
+            "namespace-a1",
+            "run-id",
+        )
+        self.assertEqual(
+            admin.request.call_args.args,
+            (
+                "POST",
+                "/kapis/iam.kubesphere.io/v1beta1/workspaces/workspace-a/workspacemembers",
+                [{"username": "test-user", "roleRef": "workspace-a-viewer"}],
+            ),
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            state["resources"][0]["path"],
+            "/kapis/iam.kubesphere.io/v1beta1/workspaces/workspace-a/workspacemembers/test-user",
+        )
+
+    def test_cluster_readiness_fails_for_unavailable_member_cluster(self) -> None:
+        admin = mock.Mock()
+        admin.request.return_value = e2e.HTTPResponse(
+            200,
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "metadata": {"name": "host"},
+                            "status": {
+                                "conditions": [
+                                    {"type": "Ready", "status": "True", "reason": "ClusterReady"}
+                                ]
+                            },
+                        },
+                        {
+                            "metadata": {"name": "member"},
+                            "status": {
+                                "conditions": [
+                                    {
+                                        "type": "Ready",
+                                        "status": "False",
+                                        "reason": "ClientInitFailed",
+                                        "message": "x509 certificate signed by unknown authority",
+                                    }
+                                ]
+                            },
+                        },
+                    ]
+                }
+            ),
+            {},
+        )
+        checks = e2e.check_cluster_readiness(admin)
+        self.assertEqual(
+            [(item["name"], item["result"]) for item in checks],
+            [("host", "PASS"), ("member", "FAIL")],
+        )
+        self.assertEqual(checks[1]["reason"], "ClientInitFailed")
+
+    def test_invitation_failure_is_setup_blocked(self) -> None:
+        admin = mock.Mock()
+        admin.request.return_value = e2e.HTTPResponse(404, '{"message":"role not found"}', {})
+        with self.assertRaisesRegex(e2e.E2EError, "SETUP_BLOCKED"):
+            e2e.invite_test_role(
+                admin,
+                {"resources": []},
+                "namespace-viewer",
+                "test-user",
+                "workspace-a",
+                "namespace-a1",
+                "run-id",
+            )
+
+    def test_membership_wait_validates_subject_role_and_scope(self) -> None:
+        admin = mock.Mock()
+        admin.request.return_value = e2e.HTTPResponse(
+            200,
+            json.dumps(
+                {
+                    "metadata": {
+                        "labels": {
+                            "iam.kubesphere.io/user-ref": "test-user",
+                            "iam.kubesphere.io/role-ref": "workspace-a-viewer",
+                            "kubesphere.io/workspace": "workspace-a",
+                        }
+                    },
+                    "subjects": [{"kind": "User", "name": "test-user"}],
+                    "roleRef": {"name": "workspace-a-viewer"},
+                }
+            ),
+            {},
+        )
+        e2e.wait_membership(
+            admin,
+            "/apis/iam.kubesphere.io/v1beta1/workspacerolebindings/test-user-workspace-a-viewer",
+            "test-user",
+            "workspace-a-viewer",
+            "workspace-a",
+            "",
+            0.1,
+        )
+
+    def test_membership_timeout_is_setup_blocked(self) -> None:
+        admin = mock.Mock()
+        with self.assertRaisesRegex(e2e.E2EError, "SETUP_BLOCKED"):
+            e2e.wait_membership(
+                admin,
+                "/apis/iam.kubesphere.io/v1beta1/workspacerolebindings/missing",
+                "test-user",
+                "workspace-a-viewer",
+                "workspace-a",
+                "",
+                0,
+            )
+
+    def test_namespace_wait_verifies_real_resource_and_workspace_label(self) -> None:
+        admin = mock.Mock()
+        admin.request.side_effect = [
+            e2e.HTTPResponse(
+                200,
+                json.dumps(
+                    {
+                        "metadata": {
+                            "name": "namespace-a1",
+                            "labels": {"kubesphere.io/workspace": "workspace-a"},
+                        }
+                    }
+                ),
+                {},
+            ),
+            e2e.HTTPResponse(
+                200,
+                json.dumps(
+                    {
+                        "metadata": {
+                            "name": "namespace-b1",
+                            "labels": {"kubesphere.io/workspace": "workspace-b"},
+                        }
+                    }
+                ),
+                {},
+            ),
+        ]
+        e2e.wait_namespaces(
+            admin,
+            {"namespace-a1": "workspace-a", "namespace-b1": "workspace-b"},
+            0.1,
+        )
+        self.assertEqual(
+            {call.args[1] for call in admin.request.call_args_list},
+            {"/api/v1/namespaces/namespace-a1", "/api/v1/namespaces/namespace-b1"},
+        )
+
+    def test_namespace_workspace_mismatch_is_setup_blocked(self) -> None:
+        admin = mock.Mock()
+        admin.request.return_value = e2e.HTTPResponse(
+            200,
+            json.dumps(
+                {
+                    "metadata": {
+                        "name": "namespace-a1",
+                        "labels": {"kubesphere.io/workspace": "wrong-workspace"},
+                    }
+                }
+            ),
+            {},
+        )
+        with self.assertRaisesRegex(e2e.E2EError, "SETUP_BLOCKED.*expected Workspace ownership"):
+            e2e.wait_namespaces(admin, {"namespace-a1": "workspace-a"}, 0)
+
+    def test_no_token_requires_401_not_403(self) -> None:
+        operation = {
+            "operationKey": "GET /kapis/example.io/v1/widgets",
+            "method": "GET",
+            "path": "/kapis/example.io/v1/widgets",
+            "resource": "widgets",
+            "verb": "list",
+            "scope": "cluster",
+        }
+        plan = {
+            "operations": [operation],
+            "matrix": [
+                {
+                    "role": "no-token",
+                    "target": "cluster",
+                    "operationKey": operation["operationKey"],
+                    "expected": "DENY",
+                }
+            ],
+        }
+        state = {
+            "runID": "run",
+            "variables": {
+                "workspace": "workspace-a",
+                "otherWorkspace": "workspace-b",
+                "namespace": "namespace-a1",
+                "siblingNamespace": "namespace-a2",
+                "otherNamespace": "namespace-b1",
+            },
+            "users": {},
+        }
+        client = mock.Mock()
+        client.request.return_value = e2e.HTTPResponse(
+            403,
+            '{"message":"system:anonymous cannot list widgets in cluster"}',
+            {},
+        )
+        results = e2e.execute_matrix(
+            plan,
+            Path("/tmp/kse-e2e.yaml"),
+            {},
+            state,
+            {"no-token": client},
+        )
+        self.assertEqual(results[0]["result"], "FAIL")
+        client.request.return_value = e2e.HTTPResponse(
+            401,
+            '{"message":"Unauthorized: token is required"}',
+            {},
+        )
+        results = e2e.execute_matrix(
+            plan,
+            Path("/tmp/kse-e2e.yaml"),
+            {},
+            state,
+            {"no-token": client},
+        )
+        self.assertEqual(results[0]["result"], "PASS")
+
     def test_cleanup_runs_in_reverse_registration_order(self) -> None:
         admin = mock.Mock()
         admin.request.side_effect = [
@@ -636,6 +932,38 @@ class RunnerTests(unittest.TestCase):
                 ("DELETE", "/parents/one"),
                 ("GET", "/children/two"),
                 ("GET", "/parents/one"),
+            ],
+        )
+
+    def test_cleanup_uses_binding_as_member_removal_verification(self) -> None:
+        admin = mock.Mock()
+        admin.request.side_effect = [
+            e2e.HTTPResponse(200, "", {}),
+            e2e.HTTPResponse(404, "", {}),
+        ]
+        errors = e2e.cleanup_state(
+            admin,
+            {
+                "resources": [
+                    {
+                        "path": "/kapis/iam.kubesphere.io/v1beta1/namespaces/ns/namespacemembers/user",
+                        "verifyPath": "/apis/iam.kubesphere.io/v1beta1/namespaces/ns/rolebindings/user-viewer",
+                    }
+                ]
+            },
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            [call.args[:2] for call in admin.request.call_args_list],
+            [
+                (
+                    "DELETE",
+                    "/kapis/iam.kubesphere.io/v1beta1/namespaces/ns/namespacemembers/user",
+                ),
+                (
+                    "GET",
+                    "/apis/iam.kubesphere.io/v1beta1/namespaces/ns/rolebindings/user-viewer",
+                ),
             ],
         )
 

@@ -416,8 +416,6 @@ def init_config(args: argparse.Namespace) -> None:
         if chart_candidates
         else "."
     )
-    backend_code = discover_backend_code(project)
-
     extension_name = ""
     extension_file = resolve(output, extension) / "extension.yaml"
     extension_root = resolve(output, extension)
@@ -479,7 +477,6 @@ def init_config(args: argparse.Namespace) -> None:
                 if extension_file.exists()
                 else "",
             },
-            "backendCode": backend_code,
         },
         "discovery": {
             "extensionName": extension_name,
@@ -487,15 +484,14 @@ def init_config(args: argparse.Namespace) -> None:
                 {"kubesphere.io/extension-ref": extension_name} if extension_name else {}
             ),
         },
-        "routing": {"mode": "auto", "pathOverrides": {}},
+        "apiMappings": {},
         "roles": {"mode": "auto", "include": DEFAULT_ROLES.copy()},
-        "scenarios": {"variables": {}, "overrides": [], "additional": []},
         "execution": {
             "resourcePrefix": sanitize_name(extension_name or project.name) + "-e2e",
             "timeout": "10m",
             "roleAggregationWait": "30s",
+            "membershipWait": "30s",
             "cleanup": "always",
-            "tenants": {"workspaces": 2, "namespacesPerWorkspace": 1},
         },
         "report": {
             "directory": "./test-results",
@@ -576,8 +572,6 @@ def validate_config_shape(path: Path, config: dict[str, Any]) -> list[str]:
     except E2EError as exc:
         errors.append(str(exc))
         sources = []
-    if not sources:
-        errors.append("sources.backendCode must contain at least one backend source")
     for index, source in enumerate(sources):
         root = source["path"]
         if not root.is_dir():
@@ -595,15 +589,29 @@ def validate_config_shape(path: Path, config: dict[str, Any]) -> list[str]:
     try:
         duration_seconds(execution.get("timeout", "10m"), "execution.timeout")
         duration_seconds(execution.get("roleAggregationWait", "30s"), "execution.roleAggregationWait")
+        duration_seconds(execution.get("membershipWait", "30s"), "execution.membershipWait")
     except E2EError as exc:
         errors.append(str(exc))
     if execution.get("cleanup", "always") not in ("always", "never"):
         errors.append("execution.cleanup must be always or never")
-    scenarios = nested(config, "scenarios", default={}) or {}
-    if not isinstance(scenarios, dict):
-        errors.append("scenarios must be an object")
+    mappings = nested(config, "apiMappings", default={}) or {}
+    if not isinstance(mappings, dict):
+        errors.append("apiMappings must be an object keyed by operationId or METHOD path")
     else:
-        errors.extend(validate_scenarios(path, config, scenarios))
+        required = {"apiGroup", "version", "resource", "verb", "scope"}
+        for key, mapping in mappings.items():
+            if not isinstance(mapping, dict):
+                errors.append(f"apiMappings.{key} must be an object")
+                continue
+            missing = sorted(required - set(mapping))
+            if missing:
+                errors.append(f"apiMappings.{key} is missing: {', '.join(missing)}")
+    scenarios = nested(config, "scenarios", default={}) or {}
+    if scenarios:
+        if not isinstance(scenarios, dict):
+            errors.append("scenarios must be an object")
+        else:
+            errors.extend(validate_scenarios(path, config, scenarios))
     return errors
 
 
@@ -924,10 +932,11 @@ def load_document(path: Path) -> dict[str, Any]:
         raise E2EError(f"cannot parse API document {path}: {exc}") from exc
 
 
-def infer_api(path: str, operation: dict[str, Any], method: str) -> dict[str, str]:
+def infer_api(path: str, operation: dict[str, Any], method: str) -> dict[str, Any]:
     clean = path.split("?", 1)[0]
     parts = [part for part in clean.split("/") if part]
     group = version = ""
+    issues: list[str] = []
     for marker in ("kapis", "apis"):
         if marker in parts:
             index = parts.index(marker)
@@ -944,13 +953,11 @@ def infer_api(path: str, operation: dict[str, Any], method: str) -> dict[str, st
                 resource = parts[index + 2]
             break
     tags = operation.get("tags") or []
-    if tags:
-        resource = str(tags[0])
     if resource.startswith("{") or not resource:
         tail = parts[-1] if parts else ""
         resource = tail if not tail.startswith("{") else (parts[-2] if len(parts) > 1 else "")
-    if resource == "{resources}":
-        resource = str(tags[0]) if tags else "resources"
+    if resource.startswith("{") or resource in ("workspace", "namespace", "cluster"):
+        resource = str(tags[0]) if tags else ""
     verb = VERBS.get(method, "")
     if method == "get":
         placeholders = re.findall(r"{([^}]+)}", clean)
@@ -961,11 +968,23 @@ def infer_api(path: str, operation: dict[str, Any], method: str) -> dict[str, st
             or operation_id.startswith("get")
             else "list"
         )
-    return {"group": group, "version": version, "resource": resource, "verb": verb, "scope": scope}
+    for field, value in (("apiGroup", group), ("version", version), ("resource", resource), ("verb", verb)):
+        if not value:
+            issues.append(f"cannot infer {field}")
+    return {
+        "group": group,
+        "version": version,
+        "resource": resource,
+        "verb": verb,
+        "scope": scope,
+        "mappingSource": "api-document",
+        "mappingIssues": issues,
+    }
 
 
 def load_operations(path: Path, config: dict[str, Any]) -> list[dict[str, Any]]:
     overrides = nested(config, "routing", "pathOverrides", default={}) or {}
+    mappings = nested(config, "apiMappings", default={}) or {}
     operations: list[dict[str, Any]] = []
     docs = nested(config, "sources", "apiDocs", default=[]) or []
     for source in docs:
@@ -982,10 +1001,25 @@ def load_operations(path: Path, config: dict[str, Any]) -> list[dict[str, Any]]:
                 if not isinstance(operation, dict):
                     continue
                 identity = infer_api(resolved_path, operation, method)
+                operation_id = operation.get("operationId") or f"{method.upper()} {resolved_path}"
+                operation_key = f"{method.upper()} {resolved_path}"
+                mapping = mappings.get(operation_id) or mappings.get(operation_key)
+                if mapping:
+                    identity.update(
+                        {
+                            "group": str(mapping["apiGroup"]),
+                            "version": str(mapping["version"]),
+                            "resource": str(mapping["resource"]),
+                            "verb": str(mapping["verb"]),
+                            "scope": str(mapping["scope"]),
+                            "mappingSource": "config",
+                            "mappingIssues": [],
+                        }
+                    )
                 operations.append(
                     {
-                        "operationId": operation.get("operationId") or f"{method.upper()} {resolved_path}",
-                        "operationKey": f"{method.upper()} {resolved_path}",
+                        "operationId": operation_id,
+                        "operationKey": operation_key,
                         "summary": operation.get("summary", ""),
                         "method": method.upper(),
                         "path": resolved_path,
@@ -1042,7 +1076,34 @@ def rule_matches(rule: dict[str, Any], operation: dict[str, Any]) -> bool:
     )
 
 
-def expected_allow(templates: list[dict[str, Any]], role: str, operation: dict[str, Any]) -> tuple[bool, list[str]]:
+def relation_allowed(role: str, operation_scope: str, target: str) -> bool:
+    scope = role_scope(role)
+    if role in ("authenticated", "no-permission"):
+        return True
+    if scope in ("global", "cluster") or target == "own":
+        return True
+    if scope == "workspace" and operation_scope == "namespace" and target == "sibling-namespace":
+        return True
+    return False
+
+
+def operation_targets(operation: dict[str, Any]) -> list[str]:
+    path = str(operation.get("path", ""))
+    if "{namespace}" in path:
+        return ["own", "sibling-namespace", "other-workspace"]
+    if "{workspace}" in path:
+        return ["own", "other-workspace"]
+    return ["cluster"]
+
+
+def expected_allow(
+    templates: list[dict[str, Any]],
+    role: str,
+    operation: dict[str, Any],
+    target: str = "own",
+) -> tuple[bool, list[str]]:
+    if target != "cluster" and not relation_allowed(role, str(operation.get("scope", "")), target):
+        return False, []
     names: list[str] = []
     scope_children = {
         "cluster": {"cluster", "workspace", "namespace"},
@@ -1084,20 +1145,22 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
     matrix = []
     for operation in operations:
         for role in roles:
-            allow, sources = expected_allow(templates, role, operation)
-            matrix.append(
-                {
-                    "role": role,
-                    "operationId": operation["operationId"],
-                    "operationKey": operation["operationKey"],
-                    "method": operation["method"],
-                    "path": operation["path"],
-                    "sar": {key: operation[key] for key in ("group", "version", "resource", "verb", "scope")},
-                    "expected": "ALLOW" if allow else "DENY",
-                    "roleTemplates": sources,
-                    "evidence": operation.get("evidence", []),
-                }
-            )
+            for target in operation_targets(operation):
+                allow, sources = expected_allow(templates, role, operation, target)
+                matrix.append(
+                    {
+                        "role": role,
+                        "target": target,
+                        "operationId": operation["operationId"],
+                        "operationKey": operation["operationKey"],
+                        "method": operation["method"],
+                        "path": operation["path"],
+                        "sar": {key: operation[key] for key in ("group", "version", "resource", "verb", "scope")},
+                        "expected": "ALLOW" if allow else "DENY",
+                        "roleTemplates": sources,
+                        "evidence": operation.get("evidence", []),
+                    }
+                )
     needs_configuration = [
         {
             "operationId": operation["operationId"],
@@ -1114,6 +1177,15 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
         for scenario in scenarios["additional"]
         if str(scenario.get("status", "")).upper() == "NEEDS_CONFIGURATION"
     )
+    needs_configuration.extend(
+        {
+            "operationId": operation["operationId"],
+            "reason": "; ".join(operation.get("mappingIssues", [])),
+            "required": f"apiMappings.{operation['operationId']}",
+        }
+        for operation in operations
+        if operation.get("mappingIssues")
+    )
     return {
         "generatedAt": utc_now(),
         "renderer": renderer,
@@ -1123,6 +1195,15 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
         "matrix": matrix,
         "scenarios": order_scenarios(scenarios["additional"]),
         "needsConfiguration": needs_configuration,
+        "testEnvironment": {
+            "workspaces": 2,
+            "primaryWorkspaceNamespaces": 2,
+            "secondaryWorkspaceNamespaces": 1,
+            "namespaceResource": "core/v1 Namespace",
+            "namespaceCreatePath": "/api/v1/namespaces",
+            "workspaceOwnershipLabel": "kubesphere.io/workspace",
+            "membershipAPI": "iam.kubesphere.io/v1beta1",
+        },
     }
 
 
@@ -1141,15 +1222,25 @@ def sanitized_summary(config: dict[str, Any]) -> dict[str, Any]:
         "authenticationMode": choose_auth(config),
         "adminUsername": nested(config, "auth", "adminUsername", default=""),
         "roles": nested(config, "roles", "include", default=DEFAULT_ROLES),
-        "backendCode": [
-            {
-                "name": item.get("name", ""),
-                "path": item.get("path", ""),
-                "language": item.get("language", "auto"),
-            }
-            for item in (nested(config, "sources", "backendCode", default=[]) or [])
-            if isinstance(item, dict)
-        ],
+        "testEnvironment": {
+            "workspaces": 2,
+            "primaryWorkspaceNamespaces": 2,
+            "secondaryWorkspaceNamespaces": 1,
+            "namespaceResource": "core/v1 Namespace",
+            "namespaceCreatePath": "/api/v1/namespaces",
+            "workspaceOwnershipLabel": "kubesphere.io/workspace",
+            "workspaceMembers": [
+                role
+                for role in (nested(config, "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES)
+                if str(role).startswith("workspace-")
+            ],
+            "namespaceMembers": [
+                role
+                for role in (nested(config, "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES)
+                if str(role).startswith("namespace-")
+            ],
+            "memberAPI": "iam.kubesphere.io/v1beta1",
+        },
         "cleanup": nested(config, "execution", "cleanup", default="always"),
     }
 
@@ -1175,6 +1266,17 @@ def validate_command(args: argparse.Namespace) -> None:
     failed_services = [item["name"] for item in api_service_checks if item["result"] != "PASS"]
     if failed_services:
         raise E2EError("APIService validation failed: " + ", ".join(failed_services))
+    membership_checks = check_membership_apis(client)
+    failed_membership = [item["name"] for item in membership_checks if item["result"] != "PASS"]
+    if failed_membership:
+        raise E2EError("KubeSphere member API validation failed: " + ", ".join(failed_membership))
+    cluster_checks = check_cluster_readiness(client)
+    failed_clusters = [item["name"] for item in cluster_checks if item["result"] != "PASS"]
+    if failed_clusters:
+        raise E2EError(
+            "cluster readiness validation failed; Workspace cleanup may be blocked: "
+            + ", ".join(failed_clusters)
+        )
     print(
         json.dumps(
             {
@@ -1184,6 +1286,8 @@ def validate_command(args: argparse.Namespace) -> None:
                 "roleTemplates": len(templates),
                 "apiOperations": len(operations),
                 "apiServices": api_service_checks,
+                "membershipAPIs": membership_checks,
+                "clusters": cluster_checks,
                 "backendSources": source_inventory(path, config),
                 "credentials": "valid",
             },
@@ -1261,13 +1365,167 @@ def wait_ready(client: Client, paths: list[str], timeout: float) -> None:
         raise E2EError(f"derived roles were not ready within {timeout:g}s: {details}")
 
 
+def wait_namespaces(client: Client, expected_workspaces: dict[str, str], timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    pending = dict(expected_workspaces)
+    last_reason: dict[str, str] = {}
+    while pending and time.monotonic() < deadline:
+        for namespace, workspace in list(pending.items()):
+            path = f"/api/v1/namespaces/{urllib.parse.quote(namespace, safe='')}"
+            response = client.request("GET", path)
+            if response.status != 200:
+                last_reason[namespace] = f"HTTP {response.status}"
+                continue
+            try:
+                value = json.loads(response.body)
+            except json.JSONDecodeError:
+                last_reason[namespace] = "invalid JSON"
+                continue
+            actual_workspace = nested(
+                value,
+                "metadata",
+                "labels",
+                "kubesphere.io/workspace",
+                default="",
+            )
+            if actual_workspace != workspace:
+                last_reason[namespace] = (
+                    f"kubesphere.io/workspace={actual_workspace!r}, expected {workspace!r}"
+                )
+                continue
+            pending.pop(namespace)
+        if pending:
+            time.sleep(0.5)
+    if pending:
+        details = ", ".join(
+            f"{namespace}: {last_reason.get(namespace, 'not observed')}"
+            for namespace in sorted(pending)
+        )
+        raise E2EError(
+            "SETUP_BLOCKED: Kubernetes Namespaces were not ready with the expected "
+            f"Workspace ownership within {timeout:g}s: {details}"
+        )
+
+
+def wait_membership(
+    client: Client,
+    binding_path: str,
+    username: str,
+    role_name: str,
+    workspace: str,
+    namespace: str,
+    timeout: float,
+) -> None:
+    deadline = time.monotonic() + timeout
+    last_status = 0
+    while time.monotonic() < deadline:
+        response = client.request("GET", binding_path)
+        last_status = response.status
+        if response.status == 200:
+            try:
+                binding = json.loads(response.body)
+            except json.JSONDecodeError:
+                binding = {}
+            labels = nested(binding, "metadata", "labels", default={}) or {}
+            subjects = binding.get("subjects", []) if isinstance(binding, dict) else []
+            role_ref = binding.get("roleRef", {}) if isinstance(binding, dict) else {}
+            subject_matches = any(
+                isinstance(subject, dict)
+                and subject.get("kind") == "User"
+                and subject.get("name") == username
+                for subject in subjects
+            )
+            scope_matches = (
+                (not workspace or labels.get("kubesphere.io/workspace") == workspace)
+                and (not namespace or nested(binding, "metadata", "namespace", default="") == namespace)
+            )
+            if (
+                labels.get("iam.kubesphere.io/user-ref") == username
+                and labels.get("iam.kubesphere.io/role-ref") == role_name
+                and role_ref.get("name") == role_name
+                and subject_matches
+                and scope_matches
+            ):
+                return
+        time.sleep(0.5)
+    raise E2EError(
+        f"SETUP_BLOCKED: membership for {username} as {role_name} "
+        f"was not ready within {timeout:g}s (last HTTP {last_status})"
+    )
+
+
+def invite_test_role(
+    admin: Client,
+    state: dict[str, Any],
+    role: str,
+    username: str,
+    workspace: str,
+    namespace: str,
+    run_id: str,
+) -> tuple[str, str, str] | None:
+    if role in ("authenticated", "no-permission"):
+        return None
+    if role.startswith("cluster-"):
+        role_name = role
+        collection = "/kapis/iam.kubesphere.io/v1beta1/clustermembers"
+        delete_path = collection + "/" + urllib.parse.quote(username, safe="")
+        binding_path = (
+            "/apis/iam.kubesphere.io/v1beta1/clusterrolebindings/"
+            + urllib.parse.quote(f"{username}-{role_name}", safe="")
+        )
+        scope_workspace = scope_namespace = ""
+    elif role.startswith("workspace-"):
+        role_name = f"{workspace}-{role.removeprefix('workspace-')}"
+        collection = (
+            "/kapis/iam.kubesphere.io/v1beta1/workspaces/"
+            + urllib.parse.quote(workspace, safe="")
+            + "/workspacemembers"
+        )
+        delete_path = collection + "/" + urllib.parse.quote(username, safe="")
+        binding_path = (
+            "/apis/iam.kubesphere.io/v1beta1/workspacerolebindings/"
+            + urllib.parse.quote(f"{username}-{role_name}", safe="")
+        )
+        scope_workspace, scope_namespace = workspace, ""
+    elif role.startswith("namespace-"):
+        role_name = role.removeprefix("namespace-")
+        collection = (
+            "/kapis/iam.kubesphere.io/v1beta1/namespaces/"
+            + urllib.parse.quote(namespace, safe="")
+            + "/namespacemembers"
+        )
+        delete_path = collection + "/" + urllib.parse.quote(username, safe="")
+        binding_path = (
+            "/apis/iam.kubesphere.io/v1beta1/namespaces/"
+            + urllib.parse.quote(namespace, safe="")
+            + "/rolebindings/"
+            + urllib.parse.quote(f"{username}-{role_name}", safe="")
+        )
+        scope_workspace, scope_namespace = "", namespace
+    elif role.startswith("platform-"):
+        bind_test_role(admin, state, role, username, workspace, namespace, run_id)
+        return None
+    else:
+        return None
+
+    response = admin.request("POST", collection, [{"username": username, "roleRef": role_name}])
+    if response.status not in (200, 201):
+        raise E2EError(
+            f"SETUP_BLOCKED: inviting {username} as {role_name} failed: "
+            f"HTTP {response.status}: {summarize(response.body)}"
+        )
+    state["resources"].append({"path": delete_path, "verifyPath": binding_path})
+    return binding_path, scope_workspace, scope_namespace
+
+
 def prepare_environment(config_path: Path, config: dict[str, Any], admin: Client, run_id: str) -> tuple[dict[str, Any], dict[str, Client]]:
     prefix = sanitize_name(nested(config, "execution", "resourcePrefix", default="extension-e2e"))
     suffix = run_id.rsplit("-", 1)[-1]
     workspace = f"{prefix}-{suffix}-a"
     other_workspace = f"{prefix}-{suffix}-b"
-    namespace = f"{prefix}-{suffix}-a"
-    other_namespace = f"{prefix}-{suffix}-b"
+    namespace = f"{prefix}-{suffix}-a1"
+    sibling_namespace = f"{prefix}-{suffix}-a2"
+    other_namespace = f"{prefix}-{suffix}-b1"
     cluster = str(nested(config, "target", "cluster", default="host"))
     manager = str(nested(config, "auth", "adminUsername", default="admin"))
     roles = nested(config, "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES
@@ -1282,6 +1540,7 @@ def prepare_environment(config_path: Path, config: dict[str, Any], admin: Client
             "workspace": workspace,
             "otherWorkspace": other_workspace,
             "namespace": namespace,
+            "siblingNamespace": sibling_namespace,
             "otherNamespace": other_namespace,
         },
     }
@@ -1305,7 +1564,31 @@ def prepare_environment(config_path: Path, config: dict[str, Any], admin: Client
         )
         create_resource(admin, "POST", "/apis/tenant.kubesphere.io/v1beta1/workspacetemplates", body, state)
         save_state(state_path, state)
-    for name, ws in ((namespace, workspace), (other_namespace, other_workspace)):
+
+    wait_timeout = duration_seconds(
+        nested(config, "execution", "roleAggregationWait", default="30s"),
+        "execution.roleAggregationWait",
+    )
+    membership_timeout = duration_seconds(
+        nested(config, "execution", "membershipWait", default="30s"),
+        "execution.membershipWait",
+    )
+    if any(role.startswith("workspace-") for role in roles):
+        wait_ready(
+            admin,
+            [
+                f"/apis/iam.kubesphere.io/v1beta1/workspaceroles/"
+                f"{urllib.parse.quote(workspace + '-' + name)}"
+                for name in ("admin", "viewer")
+            ],
+            wait_timeout,
+        )
+
+    for name, ws in (
+        (namespace, workspace),
+        (sibling_namespace, workspace),
+        (other_namespace, other_workspace),
+    ):
         body = object_body(
             "v1",
             "Namespace",
@@ -1318,22 +1601,25 @@ def prepare_environment(config_path: Path, config: dict[str, Any], admin: Client
         create_resource(admin, "POST", "/api/v1/namespaces", body, state)
         save_state(state_path, state)
 
-    wait_timeout = duration_seconds(
-        nested(config, "execution", "roleAggregationWait", default="30s"),
-        "execution.roleAggregationWait",
+    wait_namespaces(
+        admin,
+        {
+            namespace: workspace,
+            sibling_namespace: workspace,
+            other_namespace: other_workspace,
+        },
+        wait_timeout,
     )
-    role_paths: list[str] = []
-    if any(role.startswith("workspace-") for role in roles):
-        role_paths.extend(
-            f"/apis/iam.kubesphere.io/v1beta1/workspaceroles/{urllib.parse.quote(workspace + '-' + name)}"
-            for name in ("admin", "viewer")
-        )
     if any(role.startswith("namespace-") for role in roles):
-        role_paths.extend(
-            f"/apis/iam.kubesphere.io/v1beta1/namespaces/{urllib.parse.quote(namespace)}/roles/{name}"
-            for name in ("admin", "operator", "viewer")
+        wait_ready(
+            admin,
+            [
+                f"/apis/iam.kubesphere.io/v1beta1/namespaces/"
+                f"{urllib.parse.quote(namespace)}/roles/{name}"
+                for name in ("admin", "operator", "viewer")
+            ],
+            wait_timeout,
         )
-    wait_ready(admin, role_paths, wait_timeout)
 
     clients: dict[str, Client] = {"no-token": Client(admin.server, insecure=admin.context is not None)}
     for index, role in enumerate(role for role in roles if role != "no-token"):
@@ -1356,8 +1642,26 @@ def prepare_environment(config_path: Path, config: dict[str, Any], admin: Client
         )
         state["users"][role] = username
         save_state(state_path, state)
-        bind_test_role(admin, state, role, username, workspace, namespace, run_id)
+        membership = invite_test_role(admin, state, role, username, workspace, namespace, run_id)
         save_state(state_path, state)
+        if membership:
+            binding_path, scope_workspace, scope_namespace = membership
+            role_name = (
+                role
+                if role.startswith("cluster-")
+                else f"{workspace}-{role.removeprefix('workspace-')}"
+                if role.startswith("workspace-")
+                else role.removeprefix("namespace-")
+            )
+            wait_membership(
+                admin,
+                binding_path,
+                username,
+                role_name,
+                scope_workspace,
+                scope_namespace,
+                membership_timeout,
+            )
         token = login_user(config, username, password, wait_timeout)
         clients[role] = Client(admin.server, token, admin.context is not None)
 
@@ -1589,6 +1893,71 @@ def check_apiservices(admin: Client, operations: list[dict[str, Any]]) -> list[d
                 "actualStatus": response.status,
                 "result": "PASS" if response.status == 200 else "FAIL",
                 "message": "" if response.status == 200 else summarize(response.body),
+            }
+        )
+    return checks
+
+
+def check_membership_apis(admin: Client) -> list[dict[str, Any]]:
+    paths = {
+        "cluster-members": "/kapis/iam.kubesphere.io/v1beta1/clustermembers?limit=1",
+        "workspace-members": "/kapis/iam.kubesphere.io/v1beta1/workspaces/kse-e2e-api-probe/workspacemembers?limit=1",
+        "namespace-members": "/kapis/iam.kubesphere.io/v1beta1/namespaces/default/namespacemembers?limit=1",
+    }
+    checks: list[dict[str, Any]] = []
+    for name, path in paths.items():
+        response = admin.request("GET", path)
+        checks.append(
+            {
+                "name": name,
+                "path": path,
+                "actualStatus": response.status,
+                "result": "PASS" if response.status == 200 else "FAIL",
+                "message": "" if response.status == 200 else summarize(response.body),
+            }
+        )
+    return checks
+
+
+def check_cluster_readiness(admin: Client) -> list[dict[str, Any]]:
+    path = "/apis/cluster.kubesphere.io/v1alpha1/clusters?limit=500"
+    response = admin.request("GET", path)
+    if response.status != 200:
+        return [
+            {
+                "name": "cluster-list",
+                "path": path,
+                "actualStatus": response.status,
+                "result": "FAIL",
+                "reason": "ClusterListFailed",
+                "message": summarize(response.body),
+            }
+        ]
+    try:
+        items = json.loads(response.body).get("items", [])
+    except (json.JSONDecodeError, AttributeError):
+        items = []
+    checks: list[dict[str, Any]] = []
+    for item in items:
+        name = str(nested(item, "metadata", "name", default=""))
+        conditions = nested(item, "status", "conditions", default=[]) or []
+        ready = next(
+            (
+                condition
+                for condition in conditions
+                if isinstance(condition, dict) and condition.get("type") == "Ready"
+            ),
+            {},
+        )
+        is_ready = ready.get("status") == "True"
+        checks.append(
+            {
+                "name": name,
+                "path": f"/apis/cluster.kubesphere.io/v1alpha1/clusters/{urllib.parse.quote(name, safe='')}",
+                "actualStatus": response.status,
+                "result": "PASS" if is_ready else "FAIL",
+                "reason": str(ready.get("reason", "ReadyConditionMissing")),
+                "message": "" if is_ready else str(ready.get("message", "cluster Ready condition is missing")),
             }
         )
     return checks
@@ -1988,8 +2357,18 @@ def execute_matrix(
     for row in plan["matrix"]:
         operation = operation_by_key[row["operationKey"]]
         fixture = fixture_for(fixtures, operation)
+        target = row.get("target", "own")
+        workspace = state["variables"]["workspace"]
+        namespace = state["variables"]["namespace"]
+        if target == "sibling-namespace":
+            namespace = state["variables"]["siblingNamespace"]
+        elif target == "other-workspace":
+            workspace = state["variables"]["otherWorkspace"]
+            namespace = state["variables"]["otherNamespace"]
         row_variables = {
             **variables,
+            "workspace": workspace,
+            "namespace": namespace,
             "role": sanitize_name(row["role"]),
             "username": state.get("users", {}).get(row["role"], ""),
             "resources": operation["resource"],
@@ -2023,7 +2402,7 @@ def execute_matrix(
             result["requestID"] = response.headers.get("Audit-Id") or response.headers.get("X-Request-ID") or response.headers.get("X-Trace-ID") or ""
             result["response"] = summarize(response.body)
             if row["role"] == "no-token":
-                functional = response.status in (401, 403)
+                functional = response.status == 401
             elif row["expected"] == "ALLOW":
                 successes = resolved_fixture.get("expectedSuccess", []) if resolved_fixture else []
                 functional = response.status in successes if successes else 200 <= response.status < 300
@@ -2058,7 +2437,7 @@ def execute_matrix(
 
 def cleanup_state(admin: Client, state: dict[str, Any], timeout: float = 30) -> list[str]:
     errors: list[str] = []
-    pending: set[str] = set()
+    pending: dict[str, str] = {}
     for item in reversed(state.get("resources", [])):
         path = item.get("path", "")
         if not path:
@@ -2069,7 +2448,7 @@ def cleanup_state(admin: Client, state: dict[str, Any], timeout: float = 30) -> 
             if response.status not in (200, 202, 204, 404):
                 errors.append(f"{method} {path}: HTTP {response.status}: {summarize(response.body)}")
             elif method == "DELETE" and response.status != 404:
-                pending.add(path)
+                pending[str(item.get("verifyPath") or path)] = path
         except E2EError as exc:
             errors.append(str(exc))
     deadline = time.monotonic() + timeout
@@ -2077,12 +2456,15 @@ def cleanup_state(admin: Client, state: dict[str, Any], timeout: float = 30) -> 
         for path in sorted(pending):
             try:
                 if admin.request("GET", path).status == 404:
-                    pending.remove(path)
+                    del pending[path]
             except E2EError:
                 pass
         if pending:
             time.sleep(0.5)
-    errors.extend(f"DELETE {path}: object still exists after {timeout:g}s" for path in sorted(pending))
+    errors.extend(
+        f"DELETE {delete_path}: object still exists at {verify_path} after {timeout:g}s"
+        for verify_path, delete_path in sorted(pending.items())
+    )
     return errors
 
 
@@ -2100,6 +2482,8 @@ def conclusion(report: dict[str, Any]) -> str:
     results = report.get("results", [])
     evidence = (
         report.get("apiServiceChecks", [])
+        + report.get("membershipAPIChecks", [])
+        + report.get("clusterReadinessChecks", [])
         + report.get("roleTemplateChecks", [])
         + report.get("aggregationChecks", [])
     )
@@ -2114,6 +2498,7 @@ def write_report(config_path: Path, config: dict[str, Any], report: dict[str, An
     secrets_to_hide = secret_values(config)
     safe = redact(report, secrets_to_hide)
     safe["conclusion"] = conclusion(safe)
+    safe["setupStatus"] = "SETUP_BLOCKED" if safe.get("setupErrors") else "READY"
     json_path, markdown_path = report_paths(config_path, config)
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(safe, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -2184,6 +2569,12 @@ def run_command(args: argparse.Namespace) -> None:
             bool(nested(config, "target", "tls", "insecureSkipVerify", default=False)),
         )
         plan = build_plan(config_path, config)
+        unresolved_mappings = [
+            operation for operation in plan["operations"] if operation.get("mappingIssues")
+        ]
+        if unresolved_mappings:
+            names = ", ".join(operation["operationId"] for operation in unresolved_mappings)
+            raise E2EError(f"SETUP_BLOCKED: add apiMappings for unresolved operations: {names}")
         report["renderer"] = plan["renderer"]
         report["backendSources"] = plan["backendSources"]
         report["operations"] = plan["operations"]
@@ -2191,6 +2582,27 @@ def run_command(args: argparse.Namespace) -> None:
         report["scenarios"] = plan["scenarios"]
         report["needsConfiguration"] = plan["needsConfiguration"]
         report["apiServiceChecks"] = check_apiservices(admin, plan["operations"])
+        report["membershipAPIChecks"] = check_membership_apis(admin)
+        failed_membership = [
+            item["name"] for item in report["membershipAPIChecks"] if item["result"] != "PASS"
+        ]
+        if failed_membership:
+            raise E2EError(
+                "SETUP_BLOCKED: KubeSphere member APIs unavailable: "
+                + ", ".join(failed_membership)
+            )
+        report["clusterReadinessChecks"] = check_cluster_readiness(admin)
+        failed_clusters = [
+            item["name"]
+            for item in report["clusterReadinessChecks"]
+            if item["result"] != "PASS"
+        ]
+        if failed_clusters:
+            raise E2EError(
+                "SETUP_BLOCKED: registered clusters are not ready; "
+                "Workspace cleanup may be blocked: "
+                + ", ".join(failed_clusters)
+            )
         _, source_templates = render_roletemplates(config_path, config)
         report["roleTemplateChecks"] = compare_live_templates(admin, config, source_templates)
         state, clients = prepare_environment(config_path, config, admin, run_id)

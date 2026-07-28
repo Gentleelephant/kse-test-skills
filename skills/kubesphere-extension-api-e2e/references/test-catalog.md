@@ -1,70 +1,51 @@
-# Test Catalog
+# Permission Test Catalog
 
-## Contents
-
-1. Universal baseline
-2. Source-derived behavior
-3. Result rules
-4. Volcano acceptance map
-
-## Universal Baseline
+## Required Baseline
 
 Every complete run covers:
 
-- configuration safety, authentication, APIService routing, and availability;
-- source versus live RoleTemplate drift;
-- built-in role aggregation and real role bindings;
-- authenticated, cluster, workspace, namespace, no-permission, and no-token;
-- own-scope allow, read-only write denial, and cross-scope denial;
-- 401 unauthenticated versus 403 authenticated-but-forbidden;
-- valid documented CRUD where a schema example or override exists;
-- request ID, response structure, diagnostic quality, and cleanup recovery.
+- configuration safety and administrator authentication;
+- API document parsing and explicit unresolved-mapping reporting;
+- rendered versus live RoleTemplate drift;
+- built-in role aggregation;
+- KubeSphere v1beta1 member API availability;
+- all registered KubeSphere clusters are `Ready=True`; otherwise stop before
+  resource creation because Workspace cleanup can be blocked by a member
+  cluster finalizer;
+- verified cluster, Workspace, and Namespace member bindings;
+- cluster-admin and cluster-viewer;
+- workspace-admin and workspace-viewer;
+- namespace-admin, namespace-operator, and namespace-viewer;
+- authenticated/no-permission and no-token controls;
+- own scope and cross-scope behavior;
+- 401 unauthenticated versus 403 authenticated denial;
+- cleanup recovery by run ID.
 
-## Source-Derived Behavior
+## Scope Matrix
 
-Add scenarios when source evidence establishes:
+- The runner creates three real Kubernetes `core/v1 Namespace` resources
+  through `/api/v1/namespaces`, reads them back, and verifies their
+  `kubesphere.io/workspace` ownership labels before permission testing.
+- Workspace API: own Workspace and other Workspace.
+- Namespace API: invited Namespace, sibling Namespace in the same Workspace,
+  and Namespace in another Workspace.
+- Cluster API: cluster target.
 
-- mode-dependent request bodies;
-- parent/binding/owner dependencies;
-- create/read/update/patch/delete state transitions;
-- delete protection for referenced resources;
-- workspace and namespace data isolation;
-- list filtering and response field trimming;
-- admission or business rejection with a field/object-specific error.
-
-A test category is uncovered when its required valid data is missing. Return
-`NEEDS_CONFIGURATION` or `NOT_TESTED`, never PASS.
+Workspace roles are not invited to Workspace B. Namespace roles are not
+invited to Namespace A2 or Namespace B1. Namespace-only users receive no
+Workspace role.
 
 ## Result Rules
 
-- Expected allow plus accepted status and assertions: functional PASS.
-- Expected deny plus 403: functional PASS.
-- No token plus 401, or anonymous 403: functional PASS.
+- Matching RoleTemplate rule plus accepted API status: PASS.
+- Missing matching RoleTemplate rule plus 403: PASS.
+- No Token plus 401: PASS.
+- Logged-in denied user plus 403: PASS.
 - Expected deny plus 2xx: high-risk authorization bypass.
-- 401 for a logged-in user: authentication/token layer.
-- 403 mismatch: RoleTemplate, aggregation, binding, or SAR layer.
-- 404: documentation, route, APIService, deployment, or setup layer.
-- 400/409/422: fixture, admission, or business validation layer.
-- 5xx/network failure: ks-apiserver, APIService, or upstream layer.
+- Missing request data for a write: `NOT_TESTED`.
+- Role, invitation, binding, or synchronization failure:
+  `SETUP_BLOCKED`, not an extension API result.
 
-Functional and diagnostic verdicts are independent. An unclear error fails
-diagnostic quality even when authorization behavior is correct.
-
-## Volcano Acceptance Map
-
-The generic plan is equivalent to the Volcano reference only when it covers:
-
-- scheduling-policy-dependent valid Queue shapes;
-- all configured cluster/workspace/namespace roles;
-- Resource Pool, Job Queue, QueueBinding, and VolcanoJob dependencies;
-- namespace visibility limited to authorized queues;
-- namespace responses omitting management fields;
-- unauthorized Queue use by VolcanoJob;
-- Resource Pool rejection by QueueBinding;
-- cross-workspace label and parent injection;
-- deletion of Queue referenced by a binding or child;
-- CRUD state verification and tenant A/B isolation;
-- separate authorization and error-quality verdicts.
-
-Run the generic skill and Volcano reference independently to compare coverage
-and conclusions. The generic skill must never call the reference program.
+Business CRUD, admission rejection, field trimming, and plugin-specific
+dependencies are optional extensions and are not required to claim complete
+permission coverage.

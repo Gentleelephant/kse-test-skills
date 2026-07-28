@@ -1,91 +1,82 @@
 # Configuration
 
-## Contents
+## Location
 
-1. Location and lifecycle
-2. Required fields
-3. Source configuration
-4. Scenario and execution configuration
-5. Authentication and safety
-
-## Location And Lifecycle
-
-The only user-maintained file is `<project-root>/kse-e2e.yaml`. All relative
-paths resolve from its directory. Generate it with:
+Keep the only required user configuration at
+`<project-root>/kse-e2e.yaml`. Resolve all relative paths from that file.
+Generate a private template with:
 
 ```bash
 python3 <skill-dir>/scripts/run_e2e.py init --project .
 ```
 
-Initialization discovers common OpenAPI names, `extension.yaml` or
-`Chart.yaml`, and a backend project identified by `go.mod`, `pom.xml`,
-Gradle files, `pyproject.toml`, `requirements.txt`, `setup.py`, or
-`package.json`. It creates mode `0600` and adds `/kse-e2e.yaml` to the project
-`.gitignore`.
-
-Use `assets/kse-e2e.example.yaml` as the complete schema example.
-
-The file is plain YAML consumed by the Agent and runner. `schemaVersion: 1`
-identifies this configuration contract; it is not a Kubernetes object and
-does not use `apiVersion`, `kind`, `metadata`, or `spec`.
+Initialization creates mode `0600` and adds `/kse-e2e.yaml` to the project
+`.gitignore`. The file is plain YAML with `schemaVersion: 1`; it is not a
+Kubernetes object.
 
 ## Required Fields
 
-- `schemaVersion`: must be `1`.
-- `name`: local test configuration name.
-- `target.ksAPIServer`: KubeSphere API server aggregation endpoint.
-- `target.cluster`: cluster used by temporary WorkspaceTemplates.
-- `auth`: token or username/password credentials.
-- `sources.apiDocs[].path`: Swagger 2 or OpenAPI 3 JSON/YAML.
-- `sources.extension.path`: extension root or Helm chart.
-- `sources.backendCode[].path`: one or more readable backend source roots.
+- `target.ksAPIServer`: ks-apiserver aggregation endpoint.
+- `target.cluster`: target KubeSphere cluster.
+- `auth`: administrator Token or username/password.
+- `sources.apiDocs[].path`: Swagger 2 or OpenAPI 3 document.
+- `sources.extension.path`: extension root or Helm chart containing
+  RoleTemplates.
+- `roles.include`: built-in roles to test.
+- `execution`: resource prefix, readiness waits, and cleanup policy.
+- `report`: generated plan and result paths.
 
-`renderer: auto` prefers `ksbuilder` for `extension.yaml` and Helm for
-`Chart.yaml`. Values files are passed to the renderer. Older ksbuilder
-Kubernetes-1.20 compatibility failures use the existing Helm child-chart
-fallback and are reported as `helm-fallback`.
+`sources.backendCode` and `scenarios` are optional. They are not required for
+RoleTemplate permission planning.
 
-## Source Configuration
+## API Mappings
 
-Each backend source has:
+The runner derives group, version, resource, verb, and scope from each API
+path and operationId. Supply an override only when the plan reports an
+unresolved or inaccurate mapping:
 
-- `name`: stable evidence label.
-- `path`: required root, relative to `kse-e2e.yaml` or absolute.
-- `language`: `auto`, `go`, `java`, `python`, or `node`.
-- `include`: optional files/directories relative to the backend root.
-- `exclude`: ignored paths relative to the backend root.
+```yaml
+apiMappings:
+  GetSchedulingPolicy:
+    apiGroup: scheduling.volcano.sh
+    version: v1beta1
+    resource: scheduling-policy
+    verb: get
+    scope: cluster
+```
 
-The Agent may read these paths only. Generated source inventory is stored in
-the plan. Source code, fixtures, and project-specific E2E programs are never
-executed by source analysis.
+Keys may be an operationId or exact `METHOD path`. Every mapping must provide
+all five fields. RoleTemplate rules remain the expected permission source.
 
-## Scenario And Execution Configuration
+## Temporary Environment
 
-`scenarios.variables` contains values not discoverable from sources or the
-cluster. `overrides` supplies valid bodies or corrected SAR metadata for
-documented operations. `additional` describes dependency, isolation, response
-shaping, and business-rejection scenarios.
+The topology is fixed so every run has comparable scope checks:
 
-Generated output is controlled by:
+```text
+Workspace A
+├── Namespace A1: Namespace roles are invited here
+└── Namespace A2: same-Workspace denial target
 
-- `report.directory`
-- `report.plan`
-- `report.json`
-- `report.markdown`
+Workspace B
+└── Namespace B1: cross-Workspace denial target
+```
 
-Temporary resources use `execution.resourcePrefix` plus a run ID. Cleanup
-is `always` or `never`; `always` is the default.
+Workspace Admin and Viewer are invited only to Workspace A. Namespace Admin,
+Operator, and Viewer are invited only to Namespace A1. Namespace-only users
+are not also invited to the Workspace because that would add unrelated
+Workspace permissions.
+
+`execution.roleAggregationWait` controls role readiness.
+`execution.membershipWait` controls invitation/binding readiness. Cleanup is
+`always` or `never`; default to `always`.
 
 ## Authentication And Safety
 
 Authentication priority is:
 
-1. `adminToken`
-2. `adminUsername` plus `adminPassword`
+1. `auth.adminToken`
+2. `auth.adminUsername` plus `auth.adminPassword`
 
-`mode: token` and `mode: password` enforce their respective fields. `mode:
-auto` uses the priority above. Credentials remain in `kse-e2e.yaml`; the
-runner does not require credential environment variables.
-
-The config must be mode `0600` and untracked by Git. Logs, plans, state files,
-JSON, Markdown, and exceptions redact configured and generated secrets.
+Credentials stay in `kse-e2e.yaml`; no credential environment variables are
+required. Refuse a Git-tracked or group/world-readable configuration. Redact
+credentials from logs, plans, state, reports, and exceptions.

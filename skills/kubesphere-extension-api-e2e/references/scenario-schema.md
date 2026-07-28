@@ -1,4 +1,7 @@
-# Generic Scenario Schema
+# Optional Request Fixture Schema
+
+Use this file only when a write API needs a valid body for runtime permission
+enforcement. Fixtures do not define expected authorization; RoleTemplates do.
 
 ## Contents
 
@@ -85,8 +88,8 @@ validation is expected to reject it. Use `DENY` only for authorization denial.
 ## Steps, Variables, And Cleanup
 
 Available generated variables include `runID`, `cluster`, `workspace`,
-`otherWorkspace`, `namespace`, `otherNamespace`, `role`, `username`, and
-`resources`.
+`otherWorkspace`, `namespace`, `siblingNamespace`, `otherNamespace`, `role`,
+`username`, and `resources`.
 
 `capture` maps variable names to dotted JSON response paths:
 

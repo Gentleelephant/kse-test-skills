@@ -1,83 +1,70 @@
-# Backend Analysis Workflow
-
-## Contents
-
-1. Evidence order
-2. Route and authorization analysis
-3. Business behavior analysis
-4. Scenario production
-5. Confidence rules
+# Permission Analysis Workflow
 
 ## Evidence Order
 
-Analyze only paths declared in `sources`. Use this order:
+Use this order:
 
-1. API documents: operations, schemas, examples, documented statuses.
-2. Rendered RoleTemplates: scope, rules, aggregation labels, resource names.
-3. Route registration: actual path variables and handler mapping.
-4. Authorization code: SAR group, version, resource, verb, workspace,
-   namespace, and name.
-5. Handler/service/model/admission code: valid bodies, dependencies,
-   validation, filtering, mutation, and deletion protection.
-6. Error construction: status and diagnostic fields.
-7. Live objects: deployed RoleTemplates, aggregation, APIService, and runtime
-   behavior.
+1. API document for method, path, operationId, and request shape.
+2. `apiMappings` only when document inference is incomplete.
+3. Rendered RoleTemplates for expected scope, aggregation, and rules.
+4. Live RoleTemplates and aggregated built-in roles for deployed IAM state.
+5. Verified KubeSphere member bindings for the temporary user.
+6. API response for runtime enforcement.
 
-Do not infer a business rule from a symbol name alone. Trace the request from
-route to the enforcing branch.
+Do not create an independent expected-permission matrix. If a RoleTemplate is
+wrong, the test follows that configuration because it is the user's declared
+expectation.
 
-## Route And Authorization Analysis
+## Operation Mapping
 
-For each OpenAPI operation:
+For every API operation:
 
-- Confirm the registered path and HTTP method.
-- Identify collection versus item behavior.
-- Record the exact SAR attributes.
-- Match the SAR against source RoleTemplates.
-- Expand expectations across configured roles and scopes.
-- Add own-tenant, other-tenant, cluster, and unauthenticated variants where
-  the route supports them.
+- extract group and version from `/kapis/{group}/{version}` or
+  `/apis/{group}/{version}`;
+- derive cluster, Workspace, or Namespace scope from the path;
+- derive resource from the collection path, using the API tag only for generic
+  resource placeholders;
+- map POST/PUT/PATCH/DELETE to create/update/patch/delete;
+- distinguish GET from LIST using collection/item paths and operationId;
+- require `apiMappings` when any attribute remains unresolved.
 
-Correct inaccurate OpenAPI inference with an operation override rather than
-changing RoleTemplate-derived policy.
+Record whether a mapping came from the API document or configuration.
 
-## Business Behavior Analysis
+## Role And Scope Expansion
 
-Look for:
+Match operations against applicable RoleTemplate rules and aggregation labels.
+Generate:
 
-- required fields, defaults, enums, and mode-dependent request shapes;
-- references to parent, owner, binding, policy, or target resources;
-- create-before-use and delete-protection checks;
-- workspace/namespace label enforcement;
-- list selectors and post-query filtering;
-- response DTOs or field removal;
-- status-specific error constructors and message text.
+- one cluster target for cluster APIs;
+- own and other Workspace targets for Workspace APIs;
+- own Namespace, sibling Namespace, and other Workspace Namespace targets for
+  Namespace APIs.
 
-Use existing unit tests and dedicated E2E code only as evidence and coverage
-comparison. Never invoke them from this skill.
+Cluster roles apply across targets. Workspace roles apply to their Workspace
+and its Namespaces. Namespace roles apply only to their invited Namespace.
+Authenticated RoleTemplates apply to logged-in users; no-token never inherits
+them.
 
-## Scenario Production
+## Membership Setup
 
-Place valid documented-operation bodies in `scenarios.overrides`. Place
-multi-step or business-specific behavior in `scenarios.additional`. Every
-additional scenario should contain:
+Use KubeSphere v1beta1 member APIs, not direct WorkspaceRoleBinding or
+RoleBinding creation:
 
-- a stable ID and actor;
-- dependencies and setup;
-- one request and explicit expectation;
-- assertions/captures/cleanup as needed;
-- evidence with source path and line;
-- `certainty: confirmed` when an enforcing branch was traced, otherwise
-  `certainty: inferred`.
+- `/kapis/iam.kubesphere.io/v1beta1/clustermembers`
+- `/kapis/iam.kubesphere.io/v1beta1/workspaces/{workspace}/workspacemembers`
+- `/kapis/iam.kubesphere.io/v1beta1/namespaces/{namespace}/namespacemembers`
 
-If a runtime value cannot be derived, create a `NEEDS_CONFIGURATION` scenario
-whose reason names the exact missing `scenarios.variables` key.
+After invitation, read the resulting binding and verify username, roleRef,
+scope labels, Namespace, and User subject. Block API testing for that run if
+the binding does not become ready before `membershipWait`.
 
-## Confidence Rules
+## Result Classification
 
-- `confirmed`: explicit schema, RoleTemplate rule, or enforcing source branch.
-- `inferred`: consistent evidence exists but the enforcing branch is indirect.
-- `runtime`: expectation depends on a discovered cluster mode or policy.
-
-Never turn an inference into a confirmed rule because the live response
-happened to match it. Reports must retain the evidence and certainty.
+- no-token 401: PASS;
+- authenticated expected DENY 403: PASS;
+- expected DENY 2xx: authorization bypass;
+- expected ALLOW 401: authentication or Token failure;
+- expected ALLOW 403: RoleTemplate aggregation, invitation, binding, or API
+  authorization mismatch;
+- invitation or binding readiness failure: `SETUP_BLOCKED`;
+- write without a valid body: `NOT_TESTED`.

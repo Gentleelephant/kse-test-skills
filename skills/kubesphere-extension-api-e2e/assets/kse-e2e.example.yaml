@@ -29,30 +29,22 @@ sources:
     releaseName: extension-api-e2e
     namespace: extension-system
     kubeVersion: ""
-  # The Agent reads these trees to derive routes, SAR attributes, business
-  # validation, resource dependencies, filtering, and error contracts.
-  backendCode:
-    - name: extension-backend
-      path: .
-      language: auto
-      include:
-        - ./cmd
-        - ./pkg
-        - ./internal
-      exclude:
-        - ./vendor
-        - ./node_modules
-        - ./test-results
-        - ./dist
-        - ./build
 
 discovery:
   extensionName: ""
   roleTemplateSelector: {}
 
-routing:
-  mode: auto
-  pathOverrides: {}
+# Only add entries when an API operation cannot be mapped reliably from its
+# documented path and operationId to RoleTemplate attributes.
+apiMappings: {}
+# Example:
+# apiMappings:
+#   GetSchedulingPolicy:
+#     apiGroup: scheduling.volcano.sh
+#     version: v1beta1
+#     resource: scheduling-policy
+#     verb: get
+#     scope: cluster
 
 roles:
   mode: auto
@@ -68,21 +60,14 @@ roles:
     - no-permission
     - no-token
 
-scenarios:
-  # Values unavailable from API documents, charts, source, or runtime
-  # discovery belong here. This remains the only user-maintained file.
-  variables: {}
-  overrides: []
-  additional: []
-
 execution:
   resourcePrefix: extension-e2e
   timeout: 10m
   roleAggregationWait: 30s
+  membershipWait: 30s
   cleanup: always
-  tenants:
-    workspaces: 2
-    namespacesPerWorkspace: 1
+  # The runner always creates two Workspaces. Workspace A has two Namespaces;
+  # Workspace B has one. This distinguishes own, sibling, and cross-Workspace access.
 
 report:
   directory: ./test-results
