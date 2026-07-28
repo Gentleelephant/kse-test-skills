@@ -10,6 +10,13 @@ Generate a private template with:
 python3 <skill-dir>/scripts/run_e2e.py init --project .
 ```
 
+Then run the dependency, configuration, connectivity, and cluster preflight:
+
+```bash
+uv run --with-requirements <skill-dir>/requirements.txt \
+  python <skill-dir>/scripts/run_e2e.py doctor --config ./kse-e2e.yaml
+```
+
 Initialization creates mode `0600` and adds `/kse-e2e.yaml` to the project
 `.gitignore`. The file is plain YAML with `schemaVersion: 1`; it is not a
 Kubernetes object.
@@ -80,3 +87,16 @@ Authentication priority is:
 Credentials stay in `kse-e2e.yaml`; no credential environment variables are
 required. Refuse a Git-tracked or group/world-readable configuration. Redact
 credentials from logs, plans, state, reports, and exceptions.
+
+## Validation Categories
+
+- `CONFIGURATION_ERROR`: schema, source path, API mapping, scenario, duration,
+  or private-file problem. Fix it locally before retrying.
+- `ENVIRONMENT_ERROR`: missing dependency, invalid credentials, TLS, server
+  address, or connectivity problem.
+- `CLUSTER_ERROR`: APIService, IAM member API, or registered-cluster readiness
+  problem. Do not create temporary resources until it is resolved.
+
+`doctor` emits JSON checks with status, detail, and the next action. Missing
+ksbuilder or kubectl is a warning during preflight but must be resolved before
+the corresponding publish or cluster-verification step.

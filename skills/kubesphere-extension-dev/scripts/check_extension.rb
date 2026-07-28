@@ -4,6 +4,8 @@
 require "yaml"
 require "pathname"
 require "date"
+require "json"
+require "optparse"
 
 Check = Struct.new(:level, :code, :message)
 
@@ -30,16 +32,16 @@ class ExtensionChecker
     @checks = []
   end
 
-  def run
+  def run(format: "text")
     unless @root.directory?
       fail_check("root.missing", "Extension directory does not exist: #{@root}")
-      return report
+      return report(format)
     end
 
     check_extension_yaml
     check_permissions_yaml
     check_repository_docs
-    report
+    report(format)
   end
 
   private
@@ -442,26 +444,63 @@ class ExtensionChecker
     @checks << Check.new("FAIL", code, message)
   end
 
-  def report
+  def report(format)
     fail_count = @checks.count { |check| check.level == "FAIL" }
     warn_count = @checks.count { |check| check.level == "WARN" }
     pass_count = @checks.count { |check| check.level == "PASS" }
+    sorted = @checks.sort_by { |check| [%w[FAIL WARN PASS].index(check.level), check.code] }
 
-    puts "Extension: #{@root}"
-    puts "Summary: PASS=#{pass_count} WARN=#{warn_count} FAIL=#{fail_count}"
-    puts
-
-    @checks.sort_by { |check| [%w[FAIL WARN PASS].index(check.level), check.code] }.each do |check|
-      puts "#{check.level}\t#{check.code}\t#{check.message}"
+    if format == "json"
+      puts JSON.pretty_generate(
+        extension: @root.to_s,
+        summary: { "PASS" => pass_count, "WARN" => warn_count, "FAIL" => fail_count },
+        checks: sorted.map(&:to_h)
+      )
+    else
+      puts "Extension: #{@root}"
+      puts "Summary: PASS=#{pass_count} WARN=#{warn_count} FAIL=#{fail_count}"
+      puts
+      sorted.each do |check|
+        puts "#{check.level}\t#{check.code}\t#{check.message}"
+      end
     end
 
     fail_count.zero? ? 0 : 1
   end
 end
 
-if ARGV.length != 1
-  warn "Usage: ruby #{File.basename($PROGRAM_NAME)} <extension-dir>"
-  exit 2
+def main(argv)
+  options = { format: "text" }
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage: ruby #{File.basename($PROGRAM_NAME)} [options] <extension-dir>"
+    opts.on("-f", "--format FORMAT", %w[text json], "Output format: text or json") do |format|
+      options[:format] = format
+    end
+    opts.on("-h", "--help", "Show this help") do
+      puts opts
+      return 0
+    end
+  end
+
+  begin
+    parser.parse!(argv)
+  rescue OptionParser::ParseError => e
+    warn "error: #{e.message}"
+    warn parser
+    return 2
+  end
+  if argv.length != 1
+    warn "error: exactly one extension directory is required"
+    warn parser
+    return 2
+  end
+  root = Pathname.new(argv.first).expand_path
+  unless root.directory?
+    warn "error: extension directory does not exist: #{root}"
+    return 2
+  end
+
+  ExtensionChecker.new(root).run(format: options[:format])
 end
 
-exit ExtensionChecker.new(ARGV[0]).run
+exit main(ARGV) if $PROGRAM_NAME == __FILE__

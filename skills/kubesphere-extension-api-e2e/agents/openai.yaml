@@ -1,4 +1,4 @@
 interface:
   display_name: "KubeSphere Extension API Permissions"
   short_description: "Validate extension APIs against RoleTemplates"
-  default_prompt: "Use $kubesphere-extension-api-e2e to map API documentation to RoleTemplates, invite temporary KubeSphere members, and verify own-scope and cross-scope API permissions."
+  default_prompt: "Use $kubesphere-extension-api-e2e to run doctor, map API documentation to RoleTemplates, verify own-scope and cross-scope permissions, classify incomplete evidence, and prove cleanup."

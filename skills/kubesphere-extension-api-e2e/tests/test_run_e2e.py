@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import stat
 import subprocess
@@ -39,6 +41,85 @@ def roletemplate(name: str, scope: str, labels: list[str], verbs: list[str]) -> 
 
 
 class RunnerTests(unittest.TestCase):
+    def test_doctor_result_fails_only_on_failed_check(self) -> None:
+        self.assertEqual(e2e.doctor_result([{"status": "PASS"}, {"status": "WARN"}]), "PASS")
+        self.assertEqual(e2e.doctor_result([{"status": "FAIL"}]), "FAIL")
+
+    def test_doctor_reports_missing_config_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+                e2e.doctor_command(
+                    argparse.Namespace(config=str(Path(directory) / "kse-e2e.yaml"))
+                )
+            self.assertEqual(raised.exception.code, 1)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["result"], "FAIL")
+            self.assertTrue(
+                any(item["name"] == "configuration" for item in report["checks"])
+            )
+
+    def test_cleanup_is_idempotent_when_state_is_already_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "kse-e2e.yaml"
+            config.write_text("schemaVersion: 1\n", encoding="utf-8")
+            config.chmod(0o600)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                e2e.cleanup_command(
+                    argparse.Namespace(
+                        config=str(config), run_id="already-clean", execute=True
+                    )
+                )
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["result"], "PASS")
+            self.assertTrue(result["alreadyClean"])
+
+    def test_report_marks_complete_live_evidence_as_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "kse-e2e.yaml"
+            config = {"report": {"directory": "./results"}}
+            report = {
+                "runID": "run-1",
+                "target": {"ksAPIServer": "https://ks.example.com", "cluster": "host"},
+                "authenticationMode": "token",
+                "setupErrors": [],
+                "cleanupErrors": [],
+                "results": [{"result": "PASS"}],
+            }
+            with contextlib.redirect_stdout(io.StringIO()):
+                e2e.write_report(config_path, config, report)
+            generated = json.loads(
+                (Path(directory) / "results" / "kse-e2e-report.json").read_text()
+            )
+            markdown = (
+                Path(directory) / "results" / "kse-e2e-report.md"
+            ).read_text()
+            self.assertEqual(generated["evidenceStatus"], "VERIFIED")
+            self.assertIn("Evidence status: **VERIFIED**", markdown)
+            self.assertIn("| PASS | 1 |", markdown)
+
+    def test_report_without_cleanup_is_not_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "kse-e2e.yaml"
+            config = {
+                "execution": {"cleanup": "never"},
+                "report": {"directory": "./results"},
+            }
+            report = {
+                "runID": "run-1",
+                "setupErrors": [],
+                "cleanupErrors": [],
+                "results": [{"result": "PASS"}],
+            }
+            with contextlib.redirect_stdout(io.StringIO()):
+                e2e.write_report(config_path, config, report)
+            generated = json.loads(
+                (Path(directory) / "results" / "kse-e2e-report.json").read_text()
+            )
+            self.assertEqual(generated["cleanupStatus"], "NOT_RUN")
+            self.assertEqual(generated["evidenceStatus"], "INFERRED")
+
     def test_example_config_contains_no_credentials(self) -> None:
         example = e2e.load_yaml(SCRIPT.parents[1] / "assets" / "kse-e2e.example.yaml")
         auth = example["auth"]
@@ -48,6 +129,7 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("spec", example)
         self.assertEqual(auth["adminPassword"], "")
         self.assertEqual(auth["adminToken"], "")
+        self.assertEqual(auth["oauthClientSecret"], "")
         self.assertEqual(example["apiMappings"], {})
         self.assertNotIn("backendCode", example["sources"])
         self.assertNotIn("scenarios", example)

@@ -49,3 +49,16 @@ Workspace role.
 Business CRUD, admission rejection, field trimming, and plugin-specific
 dependencies are optional extensions and are not required to claim complete
 permission coverage.
+
+## Verification Evidence
+
+- `VERIFIED`: a live run records target versions, Git commit, sanitized
+  configuration, plan, expected/actual matrix, resource snapshots, and
+  successful cleanup.
+- `INFERRED`: source, rendered templates, or offline tests support the claim,
+  but the target cluster has not demonstrated it.
+- `UNVERIFIED`: no current evidence exists.
+
+Use `validation/README.md` for the durable evidence summary. Keep raw,
+secret-bearing output only in access-controlled CI artifacts or the configured
+local report directory.

@@ -1,4 +1,4 @@
 interface:
   display_name: "KubeSphere IAM/RBAC"
   short_description: "Operate and diagnose individual KubeSphere IAM actions"
-  default_prompt: "Use $kubesphere-iam-rbac to get a token, inspect a RoleTemplate or role, bind one user, or diagnose a specific ks-apiserver authorization response."
+  default_prompt: "Use $kubesphere-iam-rbac to get a token, inspect RoleTemplate evidence, create or clean up one user or binding, or diagnose a specific ks-apiserver authorization response."

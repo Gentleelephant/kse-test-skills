@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import argparse
+import contextlib
+import importlib.util
+import io
 import json
 import subprocess
 import sys
 import threading
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "ks_admin.py"
+SPEC = importlib.util.spec_from_file_location("ks_admin", SCRIPT)
+assert SPEC and SPEC.loader
+iam = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = iam
+SPEC.loader.exec_module(iam)
 
 
 class FakeKubeSphereHandler(BaseHTTPRequestHandler):
@@ -17,6 +28,15 @@ class FakeKubeSphereHandler(BaseHTTPRequestHandler):
     bodies: list[str] = []
 
     def do_POST(self) -> None:
+        self.respond()
+
+    def do_GET(self) -> None:
+        self.respond()
+
+    def do_DELETE(self) -> None:
+        self.respond()
+
+    def respond(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode()
         type(self).bodies.append(body)
@@ -146,6 +166,153 @@ class LoginTests(unittest.TestCase):
         diagnostic = json.loads(result.stdout)
         self.assertTrue(diagnostic["success"])
         self.assertTrue(diagnostic["attempts"][0]["token_found"])
+
+    def test_login_supports_json_output(self) -> None:
+        FakeKubeSphereHandler.routes["/oauth/token"] = (
+            200,
+            "application/json",
+            json.dumps({"access_token": "oauth-token"}),
+        )
+        result = self.run_login("--output", "json")
+        self.assertEqual({"token": "oauth-token"}, json.loads(result.stdout))
+
+    def test_invalid_api_body_fails_before_request(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "api-call",
+                "--server",
+                self.base_url,
+                "--token",
+                "expired",
+                "--path",
+                "/apis/example.io/v1/widgets",
+                "--body",
+                "{broken",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("--body is not valid JSON", result.stderr)
+
+    def test_expired_token_is_reported_as_401(self) -> None:
+        FakeKubeSphereHandler.routes["/apis/example.io/v1/widgets"] = (
+            401,
+            "application/json",
+            json.dumps({"message": "token expired"}),
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "api-call",
+                "--server",
+                self.base_url,
+                "--token",
+                "expired",
+                "--path",
+                "/apis/example.io/v1/widgets",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('"status": 401', result.stdout)
+
+    def test_namespace_binding_requires_full_scope_context(self) -> None:
+        args = argparse.Namespace(
+            scope="namespace", cluster="host", workspace=None, namespace="demo"
+        )
+        with self.assertRaisesRegex(SystemExit, "--workspace is required"):
+            iam.validate_scope(args)
+
+    def test_delete_is_idempotent_and_verified(self) -> None:
+        client = mock.Mock()
+        client.raw_request.side_effect = [(404, ""), (404, "")]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            iam.delete_and_verify(client, "/apis/example/users/alice", False)
+        self.assertTrue(json.loads(output.getvalue())["alreadyAbsent"])
+        self.assertEqual(
+            [call.args[:2] for call in client.raw_request.call_args_list],
+            [("DELETE", "/apis/example/users/alice"), ("GET", "/apis/example/users/alice")],
+        )
+
+    def test_network_timeout_or_tls_error_is_actionable(self) -> None:
+        client = iam.Client("https://ks.example.com")
+        with mock.patch.object(iam, "find_curl", return_value=None), mock.patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("TLS handshake timed out"),
+        ):
+            with self.assertRaisesRegex(SystemExit, "TLS handshake timed out"):
+                client.raw_request("GET", "/version")
+
+    def test_duplicate_user_returns_conflict_without_password(self) -> None:
+        path = "/apis/iam.kubesphere.io/v1alpha2/users"
+        FakeKubeSphereHandler.routes[path] = (
+            409,
+            "application/json",
+            json.dumps({"message": "user already exists"}),
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "create-user",
+                "--server",
+                self.base_url,
+                "--token",
+                "admin-token",
+                "--username",
+                "alice",
+                "--email",
+                "alice@example.com",
+                "--password",
+                "new-user-secret",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("HTTP 409", result.stderr)
+        self.assertNotIn("new-user-secret", result.stderr)
+
+    def test_duplicate_binding_returns_conflict(self) -> None:
+        path = "/apis/iam.kubesphere.io/v1beta1/clusterrolebindings"
+        FakeKubeSphereHandler.routes[path] = (
+            409,
+            "application/json",
+            json.dumps({"message": "binding already exists"}),
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "bind-role",
+                "--server",
+                self.base_url,
+                "--token",
+                "admin-token",
+                "--subject",
+                "alice",
+                "--role",
+                "cluster-viewer",
+                "--scope",
+                "cluster",
+                "--cluster",
+                "host",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("HTTP 409", result.stderr)
 
 
 if __name__ == "__main__":

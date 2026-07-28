@@ -3,7 +3,9 @@
 ## Source Model
 
 - A KubeSphere extension root is a Helm-style main chart with KubeSphere metadata. It normally contains `extension.yaml`, `permissions.yaml`, `values.yaml`, localized README files, `static/`, and optional subcharts under `charts/`.
-- Local examples are available at `/Users/zhangpeng/GolandProjects/github.com/Gentleelephant/extensions`. Treat those as implementation examples, not as immutable templates.
+- Discover examples from repositories available in the current workspace. Treat
+  them as implementation evidence, not immutable templates, and never assume a
+  user-specific absolute path.
 - `ksbuilder publish` publishes an extension into a KubeSphere cluster for testing.
 - `ksbuilder push` submits an extension package or directory to KubeSphere Cloud / Marketplace for review.
 - `ksbuilder package` creates a distributable `.tgz` package from an extension directory.
@@ -95,7 +97,7 @@ Always verify this with `ksbuilder template /path/to/extension --dry-run=client`
 Run checks in this order for existing source:
 
 ```bash
-ruby skills/kubesphere-extension-dev/scripts/check_extension.rb /path/to/extension
+ruby skills/kubesphere-extension-dev/scripts/check_extension.rb --format json /path/to/extension
 ksbuilder lint /path/to/extension --with-subcharts
 ksbuilder template /path/to/extension --dry-run=client
 ```
@@ -146,6 +148,18 @@ kubectl --kubeconfig /path/to/kubeconfig get extensionversions.extensions.kubesp
 
 Then inspect workloads, services, ConfigMaps, and extension-specific resources in the namespaces used by the extension.
 
+Capture verification evidence:
+
+```bash
+kubectl --kubeconfig /path/to/kubeconfig get jsbundles.extensions.kubesphere.io
+kubectl --kubeconfig /path/to/kubeconfig get apiservices.extensions.kubesphere.io
+kubectl --kubeconfig /path/to/kubeconfig get deployments,services,configmaps -A
+kubectl --kubeconfig /path/to/kubeconfig get events -A --sort-by=.lastTimestamp
+```
+
+Record the exact objects belonging to the extension rather than treating the
+presence of unrelated cluster resources as success.
+
 Submit to KubeSphere Cloud / Marketplace:
 
 ```bash
@@ -164,6 +178,8 @@ ksbuilder unpublish <extension-name> --kubeconfig /path/to/kubeconfig
 ```
 
 Verify extension resources and generated ConfigMaps are removed or intentionally retained.
+Also recheck JSBundle, APIService, workloads, Services, ConfigMaps, and events.
+Unexplained residual resources make rollback `PARTIAL` or `FAIL`, not `PASS`.
 
 ## Local Repository Release Convention
 

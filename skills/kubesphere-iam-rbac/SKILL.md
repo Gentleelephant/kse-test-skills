@@ -1,68 +1,111 @@
 ---
 name: kubesphere-iam-rbac
-description: Authenticate to KubeSphere and operate or diagnose individual IAM/RBAC workflows. Use when Codex needs to get a bearer token, inspect ks-apiserver IAM APIs, read RoleTemplates or one aggregated role, create a user, grant one platform/cluster/workspace/namespace role, call one API, or investigate a specific 401/403. Use kubesphere-extension-api-e2e instead for a complete temporary-environment, multi-role extension API matrix.
+description: Authenticate to KubeSphere and operate or diagnose individual IAM/RBAC workflows. Use when Codex needs to get a bearer token, inspect ks-apiserver IAM APIs, read RoleTemplates or one aggregated role, create or delete a user, grant or revoke one platform/cluster/workspace/namespace role, call one API, or investigate a specific 401/403. Use kubesphere-extension-api-e2e instead for a complete temporary-environment, multi-role extension API matrix.
 ---
 
 # KubeSphere IAM/RBAC
 
-## Overview
+## Use This Skill
 
-Use this skill to operate KubeSphere authentication, role binding, and extension API access-control tests from a terminal. Keep credentials, bearer tokens, cluster URLs, and kubeconfigs out of persisted skill files and final answers unless the user explicitly asks to reveal them.
+Use it for a focused authentication, user, role, binding, API-call, or 401/403
+task. Do not use it for a complete API document and role matrix; hand that to
+`$kubesphere-extension-api-e2e`. Use `$kubesphere-extension-dev` for extension
+packaging or publishing.
+
+## Prerequisites
+
+- A confirmed ks-apiserver base URL, not only the Console URL.
+- An existing token or administrator credentials supplied in the current task.
+- Known target scope and, where applicable, cluster, Workspace, and Namespace.
+- Read `references/kubesphere-rbac.md` before judging RoleTemplate aggregation
+  or authorization expectations.
+
+## Quick Start
+
+```bash
+SKILL_DIR=/path/to/kubesphere-iam-rbac
+SERVER=https://ks.example.com
+
+KS_TOKEN=$(python3 "$SKILL_DIR/scripts/ks_admin.py" login \
+  --server "$SERVER" --username admin)
+python3 "$SKILL_DIR/scripts/ks_admin.py" list-roletemplates \
+  --server "$SERVER" --token "$KS_TOKEN" --extension example --output json
+```
+
+Use `login --diagnose` for sanitized diagnostics. `login --output json` returns
+machine-readable token output when direct token output is inappropriate for
+the caller.
 
 ## Workflow
 
-1. Collect the target `--server` URL, username/password or existing `--token`, and the KubeSphere version if known. `--server` should point to `ks-apiserver`, not just the browser console URL. When an admin token is needed in a test environment and the user has provided a default admin test password in the current task context, try username `admin` with that password.
-2. If the request involves testing an extension API, collect or read the API doc and infer API group, version, resource, scope, verbs, and ks-apiserver path templates.
-3. Read `references/kubesphere-rbac.md` when API details, RoleTemplate aggregation, role scope, or expected status codes are unclear.
-4. Prefer `scripts/ks_admin.py` for repeatable operations:
+1. Confirm server, scope, target names, and credentials.
+2. Discover the API and list actual roles; never infer permissions from names.
+3. Read RoleTemplates and the aggregated role to derive expected ALLOW/DENY.
+4. Use `create-user` or an existing test user.
+5. Use `bind-role`; namespace scope requires cluster, Workspace, and Namespace.
+6. Read back the created user or binding; the helper performs this verification.
+7. Call the API through ks-apiserver and compare the response with the derived
+   expectation.
+8. Use `unbind-role` and `delete-user`; both verify deletion and treat an
+   already absent object as successful cleanup.
 
 ```bash
-python3 scripts/ks_admin.py login --server https://ks.example.com --username admin
-python3 scripts/ks_admin.py login --server https://ks.example.com --username admin --diagnose
-python3 scripts/ks_admin.py create-user --server https://ks.example.com --token "$KS_TOKEN" --username alice --email alice@example.com --password '...'
-python3 scripts/ks_admin.py list-roletemplates --server https://ks.example.com --token "$KS_TOKEN" --extension volcano
-python3 scripts/ks_admin.py bind-role --server https://ks.example.com --token "$KS_TOKEN" --subject alice --scope platform --role platform-admin
-python3 scripts/ks_admin.py bind-role --server https://ks.example.com --token "$KS_TOKEN" --subject alice --scope cluster --cluster host --role cluster-admin
-python3 scripts/ks_admin.py bind-role --server https://ks.example.com --token "$KS_TOKEN" --subject alice --scope workspace --workspace demo --role demo-admin
-python3 scripts/ks_admin.py bind-role --server https://ks.example.com --token "$KS_TOKEN" --subject alice --scope namespace --cluster host --namespace demo --role admin
-python3 scripts/ks_admin.py api-call --server https://ks.example.com --token "$KS_TOKEN" --path /apis/example.io/v1/namespaces/demo/widgets --expect-status 200
+python3 "$SKILL_DIR/scripts/ks_admin.py" bind-role \
+  --server "$SERVER" --token "$KS_TOKEN" --subject alice \
+  --scope namespace --cluster host --workspace demo --namespace demo-ns --role viewer
+python3 "$SKILL_DIR/scripts/ks_admin.py" api-call \
+  --server "$SERVER" --token "$ALICE_TOKEN" --method GET \
+  --path /clusters/host/apis/example.io/v1/namespaces/demo-ns/widgets \
+  --expect-status 200
+python3 "$SKILL_DIR/scripts/ks_admin.py" unbind-role \
+  --server "$SERVER" --token "$KS_TOKEN" --subject alice \
+  --scope namespace --cluster host --workspace demo --namespace demo-ns --role viewer
+python3 "$SKILL_DIR/scripts/ks_admin.py" delete-user \
+  --server "$SERVER" --token "$KS_TOKEN" --username alice
 ```
 
-5. For a focused API access-control check, derive the expected permission from
-   RoleTemplate resources first, then bind or reuse the selected user, obtain
-   its token, call the API through ks-apiserver, and compare the response.
-   For a complete role matrix with temporary tenants, fixtures, reports, and
-   cleanup, hand off to `$kubesphere-extension-api-e2e`.
-6. For one-off investigation, use `login` first, then query discovery endpoints with `curl -H "Authorization: Bearer $KS_TOKEN"`. If login fails, rerun with `--diagnose` and inspect only the sanitized HTTP status, path, and response shape.
-7. Verify every write by reading the created user, role binding, or test API object after the operation.
-8. Finish with the focused result format below.
+Use `--dry-run` before user, binding, or cleanup writes when the target is not
+already confirmed.
 
-## Focused Result
+## Success Criteria
 
-For a single IAM operation or authorization diagnosis, report:
+- The API, RoleTemplate, aggregated role, user, and binding are all identified.
+- Writes are read back; cleanup is verified with a 404.
+- Expected ALLOW matches 2xx and expected DENY matches 403.
+- 401, 404, 409, and 5xx are diagnosed, not counted as clean authorization evidence.
+- Cluster conclusions are marked `VERIFIED`, `INFERRED`, or `UNVERIFIED`.
 
-1. `Conclusion`: one of `PASS`, `FAIL`, `PARTIAL`, or `BLOCKED`.
-2. `Target`: sanitized ks-apiserver, cluster/workspace/namespace, user, and role.
-3. `Expected`: RoleTemplate rule and aggregated role evidence.
-4. `Actual`: operation, path, status, and sanitized response summary.
-5. `Diagnosis`: likely failure layer and next check.
-6. `Reproduce`: sanitized command with credentials referenced indirectly.
+## Common Failures
 
-Do not use this focused format for a complete API document or role matrix;
-hand that work to `$kubesphere-extension-api-e2e`.
+- `401`: missing, expired, malformed, or wrong-endpoint token; log in again.
+- `403`: compare RoleTemplate, aggregation, binding, user token, and path scope.
+- `404`: verify server URL, API discovery, group/version, and route prefix.
+- `409`: read the existing object and decide whether it satisfies setup.
+- `5xx`: inspect ks-apiserver, extension backend, and cluster events; report `PARTIAL`.
+- HTML response: `--server` probably points to Console instead of ks-apiserver.
+- TLS error: verify endpoint identity before explicitly using `--insecure`.
 
-## Safety Rules
+Every error explanation must include impact, next check, and cleanup/recovery.
 
-- Treat authentication and RBAC changes as live administrative actions. Confirm the exact target server and scope before writing.
-- Use least privilege by default. Prefer namespace or workspace roles over cluster or platform roles when they satisfy the goal.
-- Do not log plaintext passwords or tokens. Prefer environment variables or interactive prompts. Treat default admin test passwords as sensitive: they may be used to obtain a token in test environments, but final reports and persisted logs must show them as `<redacted>`.
-- Do not assume role names. List roles first when the role name is not provided or may differ by installation.
-- Do not guess API authorization expectations from role names alone. Read RoleTemplate resources and actual aggregated roles before judging an API result.
-- Call extension APIs through ks-apiserver unless the user or API doc explicitly says to call a backend service directly.
-- When TLS is self-signed, use `--insecure` only after the user confirms the endpoint identity.
-- KubeSphere 3.x commonly obtains API tokens from `POST /oauth/token`. KubeSphere/KSE 4.1 removed `iam.kubesphere.io/v1alpha2`, so do not depend on `/kapis/iam.kubesphere.io/v1alpha2/login` except as a legacy fallback.
+## Safety And Cleanup
 
-## Resource Guide
+- Confirm exact server and scope before writes.
+- Prefer least privilege and list roles before binding.
+- Never persist or report passwords, tokens, client secrets, or Authorization headers.
+- Use `--insecure` only after endpoint identity is confirmed.
+- Run cleanup in reverse order: unbind roles, then delete the temporary user.
 
-- `scripts/ks_admin.py`: login, user creation, role and RoleTemplate listing, role-binding, and ks-apiserver API-call helper using only Python standard library and curl when available.
-- `references/kubesphere-rbac.md`: API paths, RoleTemplate-driven permission testing, object shapes, scope mapping, verification commands, and troubleshooting.
+## Result Report
+
+Report conclusion, evidence status, sanitized target, RoleTemplate expectation,
+actual method/path/status, diagnosis, cleanup result, and sanitized reproduce
+commands. Use `PASS`, `FAIL`, `PARTIAL`, or `BLOCKED`.
+
+Use the repository `validation/README.md` template for durable cluster evidence.
+
+## Resources
+
+- `scripts/ks_admin.py`: authentication, IAM operations, JSON output, dry-run,
+  verified writes, and verified cleanup.
+- `references/kubesphere-rbac.md`: paths, object shapes, scope mapping,
+  diagnosis, expected results, and verification commands.

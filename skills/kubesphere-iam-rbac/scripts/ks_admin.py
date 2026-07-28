@@ -31,7 +31,7 @@ class Client:
         status, raw = self.raw_request(method, path, body, content_type)
         if status >= 400:
             raise SystemExit(f"{method} {path} failed: HTTP {status}: {raw}")
-        return json.loads(raw) if raw else {}
+        return parse_response(raw)
 
     def raw_request(self, method: str, path: str, body: Any = None, content_type: str = "application/json") -> tuple[int, str]:
         curl = find_curl()
@@ -265,7 +265,10 @@ def login(args: argparse.Namespace) -> None:
                 if args.diagnose:
                     print(json.dumps({"success": True, "attempts": diagnostics}, indent=2, sort_keys=True))
                     return
-                print(token)
+                if args.output == "json":
+                    print(json.dumps({"token": token}, indent=2, sort_keys=True))
+                else:
+                    print(token)
                 return
             errors.append(f"{path}: {login_problem(status, payload)}; response {response_shape(payload)}")
         except SystemExit as exc:
@@ -282,18 +285,26 @@ def create_user(args: argparse.Namespace) -> None:
     password = args.password or getpass.getpass("New user password: ")
     client = Client(args.server, args.token, args.insecure)
     body = {
-        "apiVersion": "iam.kubesphere.io/v1alpha2",
+        "apiVersion": f"iam.kubesphere.io/{args.api_version}",
         "kind": "User",
         "metadata": {"name": args.username},
         "spec": {"email": args.email, "password": password},
     }
     if args.display_name:
         body["spec"]["displayName"] = args.display_name
+    collection = f"/apis/iam.kubesphere.io/{args.api_version}/users"
     if args.dry_run:
-        print_request("POST", "/apis/iam.kubesphere.io/v1alpha2/users", body)
+        print_request("POST", collection, body)
         return
-    result = client.request("POST", "/apis/iam.kubesphere.io/v1alpha2/users", body)
-    print(json.dumps(result, indent=2, sort_keys=True))
+    client.request("POST", collection, body)
+    result = client.request("GET", f"{collection}/{args.username}")
+    print(json.dumps({"result": "PASS", "verified": redact(result)}, indent=2, sort_keys=True))
+
+
+def delete_user(args: argparse.Namespace) -> None:
+    client = Client(args.server, args.token, args.insecure)
+    path = f"/apis/iam.kubesphere.io/{args.api_version}/users/{args.username}"
+    delete_and_verify(client, path, args.dry_run)
 
 
 def list_roles(args: argparse.Namespace) -> None:
@@ -326,9 +337,16 @@ def api_call(args: argparse.Namespace) -> None:
     client = Client(args.server, args.token, args.insecure)
     body = None
     if args.body_file:
-        body = json.loads(read_text(args.body_file))
+        raw_body = read_text(args.body_file)
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"--body-file is not valid JSON: {exc}") from exc
     elif args.body:
-        body = json.loads(args.body)
+        try:
+            body = json.loads(args.body)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"--body is not valid JSON: {exc}") from exc
     status, raw = client.raw_request(args.method, args.path, body, args.content_type)
     payload: Any = raw
     try:
@@ -346,9 +364,32 @@ def binding_name(subject: str, role: str, scope: str) -> str:
     return f"{subject}-{role}-{scope}".lower().replace("_", "-").replace(".", "-")
 
 
+def validate_scope(args: argparse.Namespace) -> None:
+    if args.scope == "cluster":
+        require(args.cluster, "--cluster is required for cluster role bindings")
+    elif args.scope == "workspace":
+        require(args.workspace, "--workspace is required for workspace role bindings")
+    elif args.scope == "namespace":
+        require(args.cluster, "--cluster is required for namespace role bindings")
+        require(args.workspace, "--workspace is required for namespace role bindings")
+        require(args.namespace, "--namespace is required for namespace role bindings")
+
+
+def binding_collection(args: argparse.Namespace) -> str:
+    validate_scope(args)
+    if args.scope == "platform":
+        return "/apis/iam.kubesphere.io/v1beta1/globalrolebindings"
+    if args.scope == "cluster":
+        return "/apis/iam.kubesphere.io/v1beta1/clusterrolebindings"
+    if args.scope == "workspace":
+        return "/apis/iam.kubesphere.io/v1beta1/workspacerolebindings"
+    return f"/apis/iam.kubesphere.io/v1beta1/namespaces/{args.namespace}/rolebindings"
+
+
 def bind_role(args: argparse.Namespace) -> None:
     client = Client(args.server, args.token, args.insecure)
     name = args.name or binding_name(args.subject, args.role, args.scope)
+    path = binding_collection(args)
     if args.scope == "cluster":
         body = {
             "apiVersion": "iam.kubesphere.io/v1beta1",
@@ -360,9 +401,7 @@ def bind_role(args: argparse.Namespace) -> None:
             "subjects": [{"kind": "User", "apiGroup": "iam.kubesphere.io", "name": args.subject}],
             "roleRef": {"kind": "ClusterRole", "apiGroup": "iam.kubesphere.io", "name": args.role},
         }
-        path = "/apis/iam.kubesphere.io/v1beta1/clusterrolebindings"
     elif args.scope == "namespace":
-        require(args.namespace, "--namespace is required for namespace role bindings")
         body = {
             "apiVersion": "iam.kubesphere.io/v1beta1",
             "kind": "RoleBinding",
@@ -374,7 +413,6 @@ def bind_role(args: argparse.Namespace) -> None:
             "subjects": [{"kind": "User", "apiGroup": "iam.kubesphere.io", "name": args.subject}],
             "roleRef": {"kind": "Role", "apiGroup": "iam.kubesphere.io", "name": args.role},
         }
-        path = f"/apis/iam.kubesphere.io/v1beta1/namespaces/{args.namespace}/rolebindings"
     elif args.scope == "platform":
         body = {
             "apiVersion": "iam.kubesphere.io/v1beta1",
@@ -386,9 +424,7 @@ def bind_role(args: argparse.Namespace) -> None:
             "roleRef": {"apiGroup": "iam.kubesphere.io", "kind": "GlobalRole", "name": args.role},
             "subjects": [{"apiGroup": "iam.kubesphere.io", "kind": "User", "name": args.subject}],
         }
-        path = "/apis/iam.kubesphere.io/v1beta1/globalrolebindings"
     else:
-        require(args.workspace, "--workspace is required for workspace role bindings")
         body = {
             "apiVersion": "iam.kubesphere.io/v1beta1",
             "kind": "WorkspaceRoleBinding",
@@ -403,12 +439,39 @@ def bind_role(args: argparse.Namespace) -> None:
             "roleRef": {"apiGroup": "iam.kubesphere.io", "kind": "WorkspaceRole", "name": args.role},
             "subjects": [{"apiGroup": "iam.kubesphere.io", "kind": "User", "name": args.subject}],
         }
-        path = "/apis/iam.kubesphere.io/v1beta1/workspacerolebindings"
     if args.dry_run:
         print_request("POST", path, body)
         return
-    result = client.request("POST", path, body)
-    print(json.dumps(result, indent=2, sort_keys=True))
+    client.request("POST", path, body)
+    result = client.request("GET", f"{path}/{name}")
+    print(json.dumps({"result": "PASS", "verified": redact(result)}, indent=2, sort_keys=True))
+
+
+def unbind_role(args: argparse.Namespace) -> None:
+    client = Client(args.server, args.token, args.insecure)
+    name = args.name or binding_name(args.subject, args.role, args.scope)
+    delete_and_verify(client, f"{binding_collection(args)}/{name}", args.dry_run)
+
+
+def delete_and_verify(client: Client, path: str, dry_run: bool) -> None:
+    if dry_run:
+        print_request("DELETE", path, None)
+        return
+    status, raw = client.raw_request("DELETE", path)
+    if status not in (200, 202, 204, 404):
+        raise SystemExit(f"DELETE {path} failed: HTTP {status}: {raw}")
+    verify_status, verify_raw = client.raw_request("GET", path)
+    if verify_status != 404:
+        raise SystemExit(
+            f"DELETE {path} could not be verified: GET returned HTTP {verify_status}: {verify_raw}"
+        )
+    print(
+        json.dumps(
+            {"result": "PASS", "path": path, "alreadyAbsent": status == 404, "verifiedStatus": 404},
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def print_request(method: str, path: str, body: Any) -> None:
@@ -417,7 +480,15 @@ def print_request(method: str, path: str, body: Any) -> None:
 
 def redact(value: Any) -> Any:
     if isinstance(value, dict):
-        return {k: ("<redacted>" if k.lower() == "password" else redact(v)) for k, v in value.items()}
+        sensitive = {"password", "token", "accesstoken", "clientsecret", "authorization"}
+        return {
+            k: (
+                "<redacted>"
+                if k.lower().replace("_", "") in sensitive
+                else redact(v)
+            )
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [redact(item) for item in value]
     return value
@@ -428,11 +499,30 @@ def require(value: Any, message: str) -> None:
         raise SystemExit(message)
 
 
-def add_common(parser: argparse.ArgumentParser, token: bool = True) -> None:
+def add_common(
+    parser: argparse.ArgumentParser, token: bool = True, output_default: str = "json"
+) -> None:
     parser.add_argument("--server", required=True, help="KubeSphere base URL, for example https://ks.example.com")
     parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification")
     if token:
         parser.add_argument("--token", required=True, help="Bearer token")
+    parser.add_argument(
+        "--output",
+        choices=["text", "json"] if output_default == "text" else ["json"],
+        default=output_default,
+        help="Output format (commands other than login currently emit JSON for compatibility)",
+    )
+
+
+def add_binding_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--subject", required=True, help="Username to grant or revoke")
+    parser.add_argument("--role", required=True)
+    parser.add_argument("--scope", choices=["platform", "cluster", "workspace", "namespace"], required=True)
+    parser.add_argument("--cluster")
+    parser.add_argument("--workspace")
+    parser.add_argument("--namespace")
+    parser.add_argument("--name", help="Binding object name")
+    parser.add_argument("--dry-run", action="store_true", help="Print the request without sending it")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -440,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("login", help="Print a bearer token")
-    add_common(p, token=False)
+    add_common(p, token=False, output_default="text")
     p.add_argument("--username", required=True)
     p.add_argument("--password")
     p.add_argument("--client-id", default="kubesphere")
@@ -456,8 +546,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--email", required=True)
     p.add_argument("--password")
     p.add_argument("--display-name")
+    p.add_argument("--api-version", choices=["v1alpha2", "v1beta1"], default="v1alpha2")
     p.add_argument("--dry-run", action="store_true", help="Print the request without sending it")
     p.set_defaults(func=create_user)
+
+    p = sub.add_parser("delete-user", help="Delete a KubeSphere user and verify removal")
+    add_common(p)
+    p.add_argument("--username", required=True)
+    p.add_argument("--api-version", choices=["v1alpha2", "v1beta1"], default="v1alpha2")
+    p.add_argument("--dry-run", action="store_true", help="Print the request without sending it")
+    p.set_defaults(func=delete_user)
 
     p = sub.add_parser("list-roles", help="List roles for a scope")
     add_common(p)
@@ -484,16 +582,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("bind-role", help="Bind a role to a user")
     add_common(p)
-    p.add_argument("--subject", required=True, help="Username to grant")
-    p.add_argument("--role", required=True)
-    p.add_argument("--scope", choices=["platform", "cluster", "workspace", "namespace"], required=True)
-    p.add_argument("--cluster", help="Accepted for documentation; Kubernetes RBAC APIs do not include it in the URL")
-    p.add_argument("--workspace")
-    p.add_argument("--namespace")
+    add_binding_arguments(p)
     p.add_argument("--role-kind", default="ClusterRole", choices=["Role", "ClusterRole"], help="Deprecated; IAM bindings infer the role kind from scope")
-    p.add_argument("--name", help="Binding object name")
-    p.add_argument("--dry-run", action="store_true", help="Print the request without sending it")
     p.set_defaults(func=bind_role)
+
+    p = sub.add_parser("unbind-role", help="Delete an IAM role binding and verify removal")
+    add_common(p)
+    add_binding_arguments(p)
+    p.set_defaults(func=unbind_role)
     return parser
 
 

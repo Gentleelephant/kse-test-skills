@@ -16,7 +16,7 @@ auth:
   adminToken: ""
   loginPath: /oauth/token
   oauthClientID: kubesphere
-  oauthClientSecret: kubesphere
+  oauthClientSecret: ""
 
 sources:
   apiDocs:

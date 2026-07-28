@@ -5,57 +5,110 @@ description: Develop, inspect, test, package, publish, submit, unpublish, and tr
 
 # KubeSphere Extension Dev
 
-## Overview
+## Use This Skill
 
-Use this skill to work on KubeSphere extensions from source directories through local validation, ksbuilder packaging, cluster test publishing, KubeSphere Cloud submission, and troubleshooting. Keep kubeconfigs, Cloud API tokens, registry credentials, and bearer tokens out of persisted skill files and final answers unless the user explicitly asks to reveal them.
+Use it for extension structure, static validation, Helm rendering, packaging,
+test-cluster publishing, Marketplace submission, rollback, and installation
+diagnosis.
+
+Do not use it for a complete multi-role permission matrix; use
+`$kubesphere-extension-api-e2e`. Use `$kubesphere-iam-rbac` for one login,
+binding, RoleTemplate inspection, or 401/403 diagnosis.
+
+## Prerequisites
+
+- An extension root containing `extension.yaml`.
+- Ruby for the bundled checker.
+- `ksbuilder` for lint, rendering, package, publish, push, and unpublish.
+- `kubectl` plus an explicitly selected test kubeconfig for cluster work.
+- Read `references/kubesphere-extension.md` before structural or release changes.
+
+Never persist kubeconfigs, Cloud tokens, registry credentials, or bearer
+tokens in the skill or its reports.
+
+## Quick Start
+
+```bash
+SKILL_DIR=/path/to/kubesphere-extension-dev
+EXTENSION_DIR=/path/to/extension
+
+ruby "$SKILL_DIR/scripts/check_extension.rb" --format json "$EXTENSION_DIR"
+ksbuilder lint "$EXTENSION_DIR" --with-subcharts
+ksbuilder template "$EXTENSION_DIR" --dry-run=client
+```
+
+The checker exits `0` when no failures are found, `1` for extension findings,
+and `2` for invalid CLI input or runtime setup.
 
 ## Workflow
 
-1. Identify the extension root. Prefer a directory that contains `extension.yaml`; common examples live under `/Users/zhangpeng/GolandProjects/github.com/Gentleelephant/extensions/<extension-name>`.
-2. Read `references/kubesphere-extension.md` before making structural, packaging, publishing, or release decisions.
-3. For an existing extension, run the bundled checker first:
+Follow this order:
 
-```bash
-ruby skills/kubesphere-extension-dev/scripts/check_extension.rb /path/to/extension
-```
+1. **Preflight**: resolve the extension root and check Ruby, ksbuilder,
+   kubectl, kubeconfig, and target context.
+2. **Lint**: run the bundled checker and `ksbuilder lint --with-subcharts`.
+3. **Template**: run `ksbuilder template --dry-run=client`; inspect images,
+   pull secrets, cluster metadata, dependency conditions, RBAC, JSBundle, and
+   APIService resources.
+4. **Package**: run `ksbuilder package`; compare archive name and version with
+   `extension.yaml`.
+5. **Publish**: run `ksbuilder publish ... --kubeconfig ...` only against the
+   confirmed test cluster.
+6. **Verify**: inspect Extension, ExtensionVersion, JSBundle, APIService,
+   Deployment, Service, ConfigMap, Pod readiness, and relevant events.
+7. **Unpublish**: run `ksbuilder unpublish`; verify extension objects,
+   workloads, services, ConfigMaps, and generated resources are gone or
+   explicitly documented as retained.
 
-4. Follow with ksbuilder and Helm-oriented validation:
+`publish` installs into a test cluster. `push` submits to KubeSphere Cloud /
+Marketplace. Never substitute one for the other.
 
-```bash
-ksbuilder lint /path/to/extension --with-subcharts
-ksbuilder template /path/to/extension --dry-run=client
-```
+## Success Criteria
 
-5. For packaging, use `ksbuilder package /path/to/extension`, then verify the package name and version against `extension.yaml`.
-6. For test-cluster publishing, use `ksbuilder publish <extension-dir-or-package> --kubeconfig <path>` and verify the resulting extension resources, workloads, services, and ConfigMaps in the target cluster.
-7. For KubeSphere Cloud / Marketplace submission, use `ksbuilder login`, then `ksbuilder push <extension-dir-or-package>`, then `ksbuilder list` or `ksbuilder get <name>`. Do not confuse Cloud `push` with cluster `publish`.
-8. For cluster rollback, use `ksbuilder unpublish <extension-name>` against the same target kubeconfig and verify resources are removed.
-9. If the task becomes a complete multi-role extension API test, use
-   `$kubesphere-extension-api-e2e`. Use `$kubesphere-iam-rbac` only for a
-   one-off login, RoleTemplate, binding, or 401/403 investigation.
+- Static checker, lint, and template complete without failures.
+- Package metadata matches `extension.yaml`.
+- Published resources become ready and advertised APIs/UI assets are reachable.
+- Unpublish leaves no unexplained extension resources.
+- Claims use `VERIFIED`, `INFERRED`, or `UNVERIFIED`; only captured cluster
+  evidence may be marked `VERIFIED`.
 
-## What To Check
+## Common Failures
 
-- `extension.yaml`: required metadata, semantic version, name consistency, `staticFileDirectory`, icon/screenshot paths, dependencies, conditions, external dependencies, images, and `installationMode`.
-- Root `values.yaml`: `global` parameters, child-chart override keys, dependency `condition` keys, image registry/pull-secret propagation, and intentional commented image tag overrides.
-- `permissions.yaml`: least privilege, sensitive resources, wildcard rules, and whether requested permissions match the extension's actual resources.
-- Helm charts: `charts/<dependency-name>/Chart.yaml`, child `values.yaml`, templates, dependency tags, local subchart references, and whether templates consume `.Values.global.*` where KubeSphere injects cluster/image settings.
-- Frontend resources: frontend chart, `JSBundle`, reverse proxy, service URLs, static asset paths, and console bundle paths.
-- Backend resources: backend chart, `APIService`, service URL, API group/version, and multi-cluster agent placement.
-- Release readiness: `README.md`, `README_zh.md`, `CHANGELOG.md`, package version, release tag convention, and repository CI expectations.
+- Missing extension: locate the nearest parent containing `extension.yaml`.
+- Template failure: rerun with the same values and inspect the named template.
+- UI missing: inspect JSBundle, frontend Service, Console bundle URL, and events.
+- API missing: inspect APIService, backend Service/Pod, discovery, and group/version.
+- Agent missing: check `installationMode`, dependency tags, selected clusters,
+  and `global.clusterInfo`.
+- Permission failure: inspect `permissions.yaml`, installer service account,
+  RoleTemplates, and events.
+
+For every failure report: what failed, the impact, the next diagnostic command,
+and the safe rollback or cleanup command.
+
+## Safety And Cleanup
+
+- Confirm kubeconfig context and extension name before publish or unpublish.
+- Prefer local lint/template/package before any cluster mutation.
+- Treat secrets, binding resources, webhooks, CRDs, and wildcard RBAC as sensitive.
+- Do not claim rollback success until absence or intentional retention is verified.
 
 ## Result Report
 
-End inspection or troubleshooting tasks with a concise report:
+Report:
 
 1. `Conclusion`: `PASS`, `FAIL`, `PARTIAL`, or `BLOCKED`.
-2. `Scope`: extension name/version, source directory, target cluster or Cloud target when applicable, and test time.
-3. `Checks Run`: bundled checker, ksbuilder commands, Helm/Kubernetes commands, and files inspected.
-4. `Findings`: failed checks first, then warnings, each with file/path and recommended fix.
-5. `Package/Publish Result`: package path, cluster resources, or Cloud submission status when applicable.
-6. `Reproduce`: sanitized commands. Never include plaintext tokens, kubeconfig contents, registry credentials, or passwords.
+2. `Evidence Status`: `VERIFIED`, `INFERRED`, or `UNVERIFIED`.
+3. `Scope`: name/version, source, target, and time.
+4. `Checks Run`: checker, ksbuilder, kubectl, and inspected files.
+5. `Findings`: failures first, with evidence and fixes.
+6. `Package/Publish/Cleanup`: artifacts, resources, readiness, and residuals.
+7. `Reproduce`: sanitized commands only.
 
-## Resource Guide
+Use the repository `validation/README.md` template for durable cluster evidence.
 
-- `scripts/check_extension.rb`: static checker for extension directories using Ruby standard library YAML.
-- `references/kubesphere-extension.md`: KubeSphere extension structure, ksbuilder workflows, validation rules, release conventions, and troubleshooting notes.
+## Resources
+
+- `scripts/check_extension.rb`: text/JSON static checker.
+- `references/kubesphere-extension.md`: structure, validation, release, publish,
+  verification, rollback, and troubleshooting details.

@@ -26,8 +26,8 @@ from typing import Any
 
 try:
     import yaml
-except ImportError as exc:  # pragma: no cover - environment failure
-    raise SystemExit("PyYAML is required: python3 -m pip install PyYAML") from exc
+except ImportError:  # pragma: no cover - exercised by CLI smoke tests
+    yaml = None
 
 
 CONFIG_SCHEMA_VERSION = 1
@@ -131,7 +131,17 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def require_yaml() -> None:
+    if yaml is None:
+        raise E2EError(
+            "ENVIRONMENT_ERROR: PyYAML is required; run "
+            "uv run --with-requirements <skill-dir>/requirements.txt python "
+            "<skill-dir>/scripts/run_e2e.py <command>"
+        )
+
+
 def load_yaml(path: Path) -> Any:
+    require_yaml()
     try:
         with path.open(encoding="utf-8") as stream:
             return yaml.safe_load(stream)
@@ -142,6 +152,7 @@ def load_yaml(path: Path) -> Any:
 
 
 def dump_yaml(value: Any) -> str:
+    require_yaml()
     return yaml.safe_dump(value, allow_unicode=True, sort_keys=False)
 
 
@@ -1249,7 +1260,7 @@ def validate_command(args: argparse.Namespace) -> None:
     path, config = load_config(args.config)
     errors = validate_config_shape(path, config)
     if errors:
-        raise E2EError("configuration validation failed:\n- " + "\n- ".join(errors))
+        raise E2EError("CONFIGURATION_ERROR:\n- " + "\n- ".join(errors))
     renderer, templates = render_roletemplates(path, config)
     operations = load_operations(path, config)
     token = login(config)
@@ -1261,20 +1272,25 @@ def validate_command(args: argparse.Namespace) -> None:
     )
     response = client.request("GET", "/apis/iam.kubesphere.io/v1beta1/roletemplates?limit=1")
     if response.status >= 400:
-        raise E2EError(f"credential validation failed: HTTP {response.status} reading RoleTemplates")
+        raise E2EError(
+            f"ENVIRONMENT_ERROR: credentials cannot read RoleTemplates: HTTP {response.status}"
+        )
     api_service_checks = check_apiservices(client, operations)
     failed_services = [item["name"] for item in api_service_checks if item["result"] != "PASS"]
     if failed_services:
-        raise E2EError("APIService validation failed: " + ", ".join(failed_services))
+        raise E2EError("CLUSTER_ERROR: APIService validation failed: " + ", ".join(failed_services))
     membership_checks = check_membership_apis(client)
     failed_membership = [item["name"] for item in membership_checks if item["result"] != "PASS"]
     if failed_membership:
-        raise E2EError("KubeSphere member API validation failed: " + ", ".join(failed_membership))
+        raise E2EError(
+            "CLUSTER_ERROR: KubeSphere member API validation failed: "
+            + ", ".join(failed_membership)
+        )
     cluster_checks = check_cluster_readiness(client)
     failed_clusters = [item["name"] for item in cluster_checks if item["result"] != "PASS"]
     if failed_clusters:
         raise E2EError(
-            "cluster readiness validation failed; Workspace cleanup may be blocked: "
+            "CLUSTER_ERROR: cluster readiness validation failed; Workspace cleanup may be blocked: "
             + ", ".join(failed_clusters)
         )
     print(
@@ -2489,7 +2505,11 @@ def conclusion(report: dict[str, Any]) -> str:
     )
     if any(item.get("result") == "FAIL" for item in results) or any(item.get("result") == "FAIL" for item in evidence):
         return "FAIL"
-    if any(item.get("result") in ("NOT_TESTED", "NEEDS_CONFIGURATION", "BLOCKED") for item in results):
+    if any(
+        item.get("result")
+        in ("NOT_TESTED", "NEEDS_CONFIGURATION", "BLOCKED", "SETUP_BLOCKED")
+        for item in results
+    ):
         return "PARTIAL"
     return "PASS"
 
@@ -2499,6 +2519,22 @@ def write_report(config_path: Path, config: dict[str, Any], report: dict[str, An
     safe = redact(report, secrets_to_hide)
     safe["conclusion"] = conclusion(safe)
     safe["setupStatus"] = "SETUP_BLOCKED" if safe.get("setupErrors") else "READY"
+    cleanup_policy = nested(config, "execution", "cleanup", default="always")
+    if cleanup_policy != "always":
+        safe["cleanupStatus"] = "NOT_RUN"
+    elif safe.get("cleanupErrors"):
+        safe["cleanupStatus"] = "FAIL"
+    elif safe.get("results") and not safe.get("setupErrors"):
+        safe["cleanupStatus"] = "VERIFIED"
+    else:
+        safe["cleanupStatus"] = "NOT_RUN"
+    safe["evidenceStatus"] = (
+        "VERIFIED"
+        if safe.get("results")
+        and not safe.get("setupErrors")
+        and safe["cleanupStatus"] == "VERIFIED"
+        else "INFERRED"
+    )
     json_path, markdown_path = report_paths(config_path, config)
     json_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(json.dumps(safe, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -2509,17 +2545,30 @@ def write_report(config_path: Path, config: dict[str, Any], report: dict[str, An
         "# KubeSphere Extension API E2E",
         "",
         f"- Conclusion: **{safe['conclusion']}**",
+        f"- Evidence status: **{safe['evidenceStatus']}**",
         f"- Run ID: `{safe.get('runID', '')}`",
         f"- Target: `{safe.get('target', {}).get('ksAPIServer', '')}`",
         f"- Cluster: `{safe.get('target', {}).get('cluster', '')}`",
         f"- Authentication: `{safe.get('authenticationMode', '')}`",
         f"- Results: `{json.dumps(counts, ensure_ascii=False, sort_keys=True)}`",
+        f"- Setup: `{safe['setupStatus']}`",
+        f"- Cleanup: `{safe['cleanupStatus']}`",
+        "",
+        "## Result Summary",
+        "",
+        "| Result | Count |",
+        "| --- | ---: |",
+    ]
+    lines.extend(f"| {result} | {count} |" for result, count in sorted(counts.items()))
+    lines.extend(
+        [
         "",
         "## Mismatches",
         "",
         "| Role | Method | Path | Expected | Actual | Layer | Suggestion |",
         "| --- | --- | --- | --- | --- | --- | --- |",
-    ]
+        ]
+    )
     for item in safe.get("results", []):
         if item.get("result") == "FAIL":
             lines.append(
@@ -2627,6 +2676,7 @@ def run_command(args: argparse.Namespace) -> None:
             report["cleanupErrors"] = cleanup_state(admin, state)
             if not report["cleanupErrors"] and state_path.exists():
                 state_path.unlink()
+        report["finishedAt"] = utc_now()
         report["durationMs"] = round((time.monotonic() - started) * 1000)
         write_report(config_path, config, report)
     if conclusion(redact(report, secret_values(config))) != "PASS":
@@ -2639,7 +2689,18 @@ def cleanup_command(args: argparse.Namespace) -> None:
     config_path, config = load_config(args.config)
     path = state_file(config_path, config, sanitize_name(args.run_id))
     if not path.exists():
-        raise E2EError(f"run state does not exist: {path}")
+        print(
+            json.dumps(
+                {
+                    "result": "PASS",
+                    "runID": sanitize_name(args.run_id),
+                    "alreadyClean": True,
+                    "state": str(path),
+                },
+                indent=2,
+            )
+        )
+        return
     state = json.loads(path.read_text(encoding="utf-8"))
     token = login(config)
     target = nested(config, "target", default={}) or {}
@@ -2652,12 +2713,148 @@ def cleanup_command(args: argparse.Namespace) -> None:
     if errors:
         raise E2EError("cleanup failed:\n- " + "\n- ".join(errors))
     path.unlink()
-    print(json.dumps({"result": "PASS", "runID": state.get("runID"), "removedState": str(path)}, indent=2))
+    print(
+        json.dumps(
+            {
+                "result": "PASS",
+                "runID": state.get("runID"),
+                "alreadyClean": False,
+                "verified": True,
+                "removedState": str(path),
+            },
+            indent=2,
+        )
+    )
+
+
+def doctor_result(checks: list[dict[str, str]]) -> str:
+    return "FAIL" if any(item["status"] == "FAIL" for item in checks) else "PASS"
+
+
+def doctor_command(args: argparse.Namespace) -> None:
+    checks: list[dict[str, str]] = [
+        {
+            "name": "python",
+            "status": "PASS" if sys.version_info >= (3, 11) else "FAIL",
+            "detail": sys.version.split()[0],
+            "next": "Install Python 3.11 or newer" if sys.version_info < (3, 11) else "",
+        },
+        {
+            "name": "pyyaml",
+            "status": "PASS" if yaml is not None else "FAIL",
+            "detail": getattr(yaml, "__version__", "not installed"),
+            "next": (
+                "Run with uv --with-requirements <skill-dir>/requirements.txt"
+                if yaml is None
+                else ""
+            ),
+        },
+    ]
+    for command in ("ksbuilder", "kubectl"):
+        path = shutil.which(command)
+        checks.append(
+            {
+                "name": command,
+                "status": "PASS" if path else "WARN",
+                "detail": path or "not found on PATH",
+                "next": f"Install {command} before cluster validation" if not path else "",
+            }
+        )
+
+    config = None
+    config_path = Path(args.config).expanduser().resolve()
+    if yaml is not None:
+        try:
+            config_path, config = load_config(args.config)
+            errors = validate_config_shape(config_path, config)
+            checks.append(
+                {
+                    "name": "configuration",
+                    "status": "FAIL" if errors else "PASS",
+                    "detail": "; ".join(errors) if errors else f"private config: {config_path}",
+                    "next": "Fix the listed configuration fields and rerun doctor" if errors else "",
+                }
+            )
+        except E2EError as exc:
+            checks.append(
+                {
+                    "name": "configuration",
+                    "status": "FAIL",
+                    "detail": str(exc),
+                    "next": f"Run init --project {config_path.parent}",
+                }
+            )
+
+    if config is not None and not any(item["status"] == "FAIL" for item in checks):
+        try:
+            token = login(config)
+            target = nested(config, "target", default={}) or {}
+            client = Client(
+                str(target["ksAPIServer"]),
+                token,
+                bool(nested(config, "target", "tls", "insecureSkipVerify", default=False)),
+            )
+            response = client.request(
+                "GET", "/apis/iam.kubesphere.io/v1beta1/roletemplates?limit=1"
+            )
+            server_status = "PASS" if response.status == 200 else "FAIL"
+            checks.append(
+                {
+                    "name": "ks-apiserver",
+                    "status": server_status,
+                    "detail": f"RoleTemplate API HTTP {response.status}",
+                    "next": (
+                        ""
+                        if server_status == "PASS"
+                        else "Verify target.ksAPIServer and administrator credentials"
+                    ),
+                }
+            )
+            operations = load_operations(config_path, config)
+            live_checks = (
+                check_apiservices(client, operations)
+                + check_membership_apis(client)
+                + check_cluster_readiness(client)
+            )
+            for item in live_checks:
+                status = str(item["result"])
+                checks.append(
+                    {
+                        "name": str(item["name"]),
+                        "status": status,
+                        "detail": f"HTTP {item.get('actualStatus', '')} {item.get('message', '')}".strip(),
+                        "next": (
+                            ""
+                            if status == "PASS"
+                            else "Restore the API or cluster readiness before run --execute"
+                        ),
+                    }
+                )
+        except (E2EError, OSError, ValueError) as exc:
+            checks.append(
+                {
+                    "name": "cluster-preflight",
+                    "status": "FAIL",
+                    "detail": str(redact(str(exc), secret_values(config))),
+                    "next": "Verify server reachability, TLS settings, and credentials",
+                }
+            )
+
+    result = doctor_result(checks)
+    print(json.dumps({"result": result, "checks": checks}, indent=2, ensure_ascii=False))
+    if result != "PASS":
+        raise SystemExit(1)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+
+    doctor = commands.add_parser(
+        "doctor", help="Check dependencies, private configuration, connectivity, and cluster APIs"
+    )
+    doctor.add_argument("--config", default=CONFIG_NAME)
+    doctor.set_defaults(func=doctor_command)
 
     init = commands.add_parser("init", help="Create a local secret-bearing kse-e2e.yaml")
     init.add_argument("--project", default=".")

@@ -5,94 +5,116 @@ description: Plan, run, diagnose, and clean up RoleTemplate-driven KubeSphere ex
 
 # KubeSphere Extension API Permission E2E
 
-Use RoleTemplates as the expected permission design. Do not create a second
-user-maintained permission matrix and do not make plugin business E2E part of
-the default workflow.
+## Use This Skill
 
-## Contract
+Use it for a complete temporary-environment, multi-role extension API
+permission matrix. Use `$kubesphere-iam-rbac` for one focused IAM operation or
+401/403. Use `$kubesphere-extension-dev` for packaging and publishing.
 
-- Work from the extension project root.
+RoleTemplates are the expected permission design. Do not maintain a second
+manual permission matrix or make business E2E part of the default workflow.
+
+## Prerequisites
+
+- Run from the extension project root.
 - Keep the only required user configuration at `./kse-e2e.yaml`.
-- Resolve relative paths from the configuration directory.
-- Read API documents and render the configured extension or Helm chart.
-- Call extension APIs through ks-apiserver.
-- Write plans, reports, and recovery state only below `report.directory`.
+- Provide API documents and an extension/Helm source containing RoleTemplates.
+- Use a disposable KubeSphere test environment with every registered cluster
+  `Ready=True`.
+- Read `references/configuration.md` before configuration changes and
+  `references/test-catalog.md` before claiming complete coverage.
 
-If the configuration is absent, stop before accessing a cluster and offer:
+## Quick Start
+
+Run through the isolated dependency environment:
 
 ```bash
-python3 <skill-dir>/scripts/run_e2e.py init --project .
+SKILL_DIR=/path/to/kubesphere-extension-api-e2e
+RUNNER="uv run --with-requirements $SKILL_DIR/requirements.txt python $SKILL_DIR/scripts/run_e2e.py"
+
+$RUNNER init --project .
+$RUNNER doctor --config ./kse-e2e.yaml
+$RUNNER validate --config ./kse-e2e.yaml
+$RUNNER plan --config ./kse-e2e.yaml
+$RUNNER run --config ./kse-e2e.yaml --execute
 ```
 
-Read `references/configuration.md` when creating or changing configuration.
+Without `uv`, install `requirements.txt` into an isolated virtual environment.
+If configuration is absent, stop before cluster access and run `init`.
 
 ## Workflow
 
-1. Run `validate` to check configuration, API documents, RoleTemplate
-   rendering, credentials, APIService routes, KubeSphere v1beta1 member APIs,
-   and every registered cluster's `Ready` condition. An unavailable member
-   cluster can block Workspace and WorkspaceRole finalizers even when the test
-   Workspace is placed only on `host`, so execution must stop before creating
-   resources.
-2. Run `plan` to map each documented operation to
-   group/version/resource/verb/scope and derive ALLOW/DENY from RoleTemplates.
-3. Add an `apiMappings` entry only for operations whose authorization
-   attributes cannot be inferred reliably.
-4. Review the sanitized plan. It always uses two Workspaces and creates three
-   real Kubernetes `core/v1 Namespace` resources through
-   `/api/v1/namespaces`: two in Workspace A and one in Workspace B. The runner
-   verifies each Namespace's `kubesphere.io/workspace` label before inviting
-   users or testing extension APIs.
-5. Run with `--execute`. The runner creates users and invites them through
-   `clustermembers`, `workspacemembers`, and `namespacemembers`, then verifies
-   the resulting binding before testing extension APIs.
-6. Treat invitation, role readiness, or membership synchronization failures as
-   `SETUP_BLOCKED`, not extension API permission failures.
+1. **Doctor** checks Python/PyYAML, ksbuilder, kubectl, private configuration,
+   ks-apiserver authentication, member APIs, and cluster readiness.
+2. **Validate** checks configuration, API documents, RoleTemplate rendering,
+   credentials, APIService routes, membership APIs, and every cluster.
+   Errors are categorized as `CONFIGURATION_ERROR`, `ENVIRONMENT_ERROR`, or
+   `CLUSTER_ERROR`.
+3. **Plan** maps every operation to group/version/resource/verb/scope, records
+   mapping evidence, and derives ALLOW/DENY only from RoleTemplates.
+4. Review unresolved mappings, source/live RoleTemplate drift, roles, own and
+   cross-scope targets, and write fixtures. Add `apiMappings` only when needed.
+5. **Run** with explicit `--execute`. The runner creates temporary users,
+   Workspaces, Namespaces, memberships, and verified bindings before API calls.
+6. Interpret `PASS`, `FAIL`, `PARTIAL`, `NOT_TESTED`, and `SETUP_BLOCKED`
+   separately. Expected DENY plus 2xx is a high-risk bypass.
+7. Default cleanup is `always`. Recover an interrupted run by ID:
 
 ```bash
-python3 <skill-dir>/scripts/run_e2e.py validate --config ./kse-e2e.yaml
-python3 <skill-dir>/scripts/run_e2e.py plan --config ./kse-e2e.yaml
-python3 <skill-dir>/scripts/run_e2e.py run --config ./kse-e2e.yaml --execute
+$RUNNER cleanup --config ./kse-e2e.yaml --run-id <run-id> --execute
 ```
 
-Clean an interrupted run by ID:
+Cleanup verifies removals. Repeating cleanup after state removal returns PASS
+with `alreadyClean: true`.
 
-```bash
-python3 <skill-dir>/scripts/run_e2e.py cleanup \
-  --config ./kse-e2e.yaml --run-id <run-id> --execute
-```
+## Success Criteria
 
-Read `references/test-catalog.md` before claiming complete permission coverage.
+- Doctor and validate pass before resource creation.
+- Every documented operation appears in the plan and result.
+- Own, sibling Namespace, other Workspace, authenticated/no-permission, and
+  no-token controls are covered as applicable.
+- No-token returns 401; authenticated denial returns 403.
+- Writes without valid fixtures are `NOT_TESTED`, never PASS.
+- Setup failures are `SETUP_BLOCKED`, not extension authorization failures.
+- Cleanup has no errors or unexplained residual resources.
+- Only captured cluster evidence is `VERIFIED`; otherwise report
+  `INFERRED` or `UNVERIFIED`.
 
-## Result Rules
+## Common Failures
 
-- Rendered RoleTemplates are expected permissions.
-- Live RoleTemplates show the deployed design.
-- Aggregated roles and verified member bindings show effective IAM setup.
-- API responses show runtime enforcement.
-- Own-scope access follows matching RoleTemplate rules.
-- Workspace roles may apply to Namespaces in their own Workspace.
-- Sibling Namespace and other Workspace targets must be tested separately.
-- No Token must return 401; an authenticated user without permission must
-  return 403.
-- A write without a valid request body is `NOT_TESTED`, never PASS.
-- Expected DENY plus 2xx is a high-risk authorization bypass.
+- Missing configuration: run `init`; keep the file `0600` and Git-ignored.
+- Missing PyYAML: use the Quick Start `uv` command.
+- Unresolved mapping: add one exact `apiMappings` entry.
+- APIService failure: inspect APIService, backend Service/Pod, and discovery.
+- Member API failure: verify KubeSphere v1beta1 IAM member endpoints.
+- Cluster not ready: stop before resource creation to avoid finalizer cleanup issues.
+- Binding timeout: inspect invitation, roleRef, scope labels, user subject, and aggregation.
+- Interrupted run: use the recorded run ID with `cleanup --execute`.
 
-## Safety
+Every failure must state what failed, impact, next check, and recovery.
 
-- Keep `kse-e2e.yaml` mode `0600`, ignored by Git, and never committed.
+## Safety And Cleanup
+
+- Keep `kse-e2e.yaml` mode `0600`, Git-ignored, and untracked.
 - Never print or persist passwords, tokens, OAuth secrets, temporary passwords,
-  or complete Authorization headers.
-- Require explicit `--execute` before creating or deleting live resources.
-- Default cleanup to `always`.
+  or full Authorization headers.
+- Require `--execute` for live creation or deletion.
+- Resolve report paths below `report.directory`.
+- Default cleanup to `always`; preserve state when cleanup cannot be verified.
+
+## Result Report
+
+Report conclusion, evidence status, sanitized scope and versions, plan evidence,
+permission matrix, interface/API results, mismatches, setup status, cleanup
+status, untested rows, and sanitized reproduction commands.
+
+Use the repository `validation/README.md` template for durable cluster evidence.
 
 ## Resources
 
-- `scripts/run_e2e.py`: initialize, validate, plan, invite members, execute,
-  report, and clean up.
-- `assets/kse-e2e.example.yaml`: complete minimal configuration template.
-- `references/configuration.md`: configuration fields and defaults.
-- `references/analysis-workflow.md`: API-to-RoleTemplate mapping rules.
-- `references/test-catalog.md`: required role and scope coverage.
-- `references/scenario-schema.md`: optional request fixtures for write APIs;
-  not required for permission planning.
+- `scripts/run_e2e.py`: doctor, init, validate, plan, run, report, and cleanup.
+- `assets/kse-e2e.example.yaml`: credential-free configuration template.
+- `references/configuration.md`: configuration and validation categories.
+- `references/analysis-workflow.md`: API-to-RoleTemplate rules.
+- `references/test-catalog.md`: required coverage and evidence.
+- `references/scenario-schema.md`: optional valid write fixtures.

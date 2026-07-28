@@ -41,6 +41,20 @@ kubectl --context "$CONTEXT" api-resources | grep -i '<group-or-resource>'
    - `409`: object already exists; read it and decide whether it satisfies the test setup.
 8. Produce the standard final report. Keep tokens, passwords, and full secret-bearing request bodies out of the report.
 
+## Status Diagnosis
+
+| Status | Meaning | Next check | Authorization evidence |
+| --- | --- | --- | --- |
+| 401 | Missing, expired, malformed, or wrong-endpoint token | Login again and inspect sanitized diagnostics | FAIL for expected ALLOW; otherwise not a denial result |
+| 403 | Authenticated request denied | RoleTemplate, aggregated role, binding, token subject, and scoped path | PASS only for expected DENY |
+| 404 | Route or resource was not found | Discovery, server URL, group/version, cluster prefix, and object name | PARTIAL |
+| 409 | Existing object conflicts with setup | Read it and compare owner, role, scope, and run identity | PARTIAL until resolved |
+| 5xx | Server, gateway, or extension backend failure | ks-apiserver/backend logs, Pods, APIService, and events | PARTIAL or BLOCKED |
+
+Network timeout and TLS failures are environment failures. Confirm endpoint
+identity before using `--insecure`; do not convert them into authorization
+results.
+
 ## Standard Final Result
 
 The final result is a test report, not just raw command output. It must be stable enough that two agents testing different extensions can compare results directly.
@@ -435,3 +449,17 @@ curl -sk "$SERVER/apis/iam.kubesphere.io/v1beta1/namespaces/$NAMESPACE/rolebindi
 ```
 
 When direct KubeSphere IAM writes fail, use kubeconfig access only if the user has provided or approved it. Do not assume platform or workspace permissions have equivalent Kubernetes RBAC objects.
+
+Clean temporary IAM resources in reverse order:
+
+```bash
+python3 scripts/ks_admin.py unbind-role \
+  --server "$SERVER" --token "$KS_TOKEN" --subject "$USERNAME" \
+  --scope namespace --cluster "$CLUSTER" --workspace "$WORKSPACE" \
+  --namespace "$NAMESPACE" --role viewer
+python3 scripts/ks_admin.py delete-user \
+  --server "$SERVER" --token "$KS_TOKEN" --username "$USERNAME"
+```
+
+Both commands verify that a subsequent GET returns 404. Repeating cleanup is
+safe: an already absent object is reported as successful cleanup.
