@@ -30,8 +30,7 @@ except ImportError as exc:  # pragma: no cover - environment failure
     raise SystemExit("PyYAML is required: python3 -m pip install PyYAML") from exc
 
 
-CONFIG_API_VERSION = "testing.kubesphere.io/v1alpha1"
-CONFIG_KIND = "ExtensionAPIE2E"
+CONFIG_SCHEMA_VERSION = 1
 CONFIG_NAME = "kse-e2e.yaml"
 RUN_LABEL = "testing.kubesphere.io/run-id"
 METHODS = ("get", "post", "put", "patch", "delete")
@@ -311,16 +310,16 @@ def discover_backend_code(project: Path) -> list[dict[str, Any]]:
 
 
 def backend_sources(config_path: Path, config: dict[str, Any]) -> list[dict[str, Any]]:
-    configured = nested(config, "spec", "sources", "backendCode", default=[]) or []
+    configured = nested(config, "sources", "backendCode", default=[]) or []
     if not isinstance(configured, list):
-        raise E2EError("spec.sources.backendCode must be a list")
+        raise E2EError("sources.backendCode must be a list")
     result: list[dict[str, Any]] = []
     for index, item in enumerate(configured):
         if not isinstance(item, dict):
-            raise E2EError(f"spec.sources.backendCode[{index}] must be an object")
+            raise E2EError(f"sources.backendCode[{index}] must be an object")
         raw_path = str(item.get("path", "")).strip()
         if not raw_path:
-            raise E2EError(f"spec.sources.backendCode[{index}].path is required")
+            raise E2EError(f"sources.backendCode[{index}].path is required")
         root = resolve(config_path, raw_path)
         language = str(item.get("language", "auto"))
         if language == "auto":
@@ -451,68 +450,65 @@ def init_config(args: argparse.Namespace) -> None:
     )
 
     config = {
-        "apiVersion": CONFIG_API_VERSION,
-        "kind": CONFIG_KIND,
-        "metadata": {"name": name},
-        "spec": {
-            "target": {
-                "ksAPIServer": server,
-                "cluster": cluster,
-                "tls": {"insecureSkipVerify": False},
+        "schemaVersion": CONFIG_SCHEMA_VERSION,
+        "name": name,
+        "target": {
+            "ksAPIServer": server,
+            "cluster": cluster,
+            "tls": {"insecureSkipVerify": False},
+        },
+        "auth": {
+            "mode": auth_mode,
+            "adminUsername": username,
+            "adminPassword": password,
+            "adminToken": token,
+            "loginPath": "/oauth/token",
+            "oauthClientID": "kubesphere",
+            "oauthClientSecret": client_secret,
+        },
+        "sources": {
+            "apiDocs": [{"path": api_doc, "format": "auto"}],
+            "extension": {
+                "path": extension,
+                "renderer": "auto",
+                "valuesFiles": values_files,
+                "releaseName": sanitize_name(extension_name or project.name),
+                "namespace": (extension_data.get("namespace") if extension_file.exists() else None)
+                or f"{sanitize_name(extension_name or project.name)}-system",
+                "kubeVersion": minimum_kube_version(str(extension_data.get("kubeVersion", "")))
+                if extension_file.exists()
+                else "",
             },
-            "auth": {
-                "mode": auth_mode,
-                "adminUsername": username,
-                "adminPassword": password,
-                "adminToken": token,
-                "loginPath": "/oauth/token",
-                "oauthClientID": "kubesphere",
-                "oauthClientSecret": client_secret,
-            },
-            "sources": {
-                "apiDocs": [{"path": api_doc, "format": "auto"}],
-                "extension": {
-                    "path": extension,
-                    "renderer": "auto",
-                    "valuesFiles": values_files,
-                    "releaseName": sanitize_name(extension_name or project.name),
-                    "namespace": (extension_data.get("namespace") if extension_file.exists() else None)
-                    or f"{sanitize_name(extension_name or project.name)}-system",
-                    "kubeVersion": minimum_kube_version(str(extension_data.get("kubeVersion", "")))
-                    if extension_file.exists()
-                    else "",
-                },
-                "backendCode": backend_code,
-            },
-            "discovery": {
-                "extensionName": extension_name,
-                "roleTemplateSelector": (
-                    {"kubesphere.io/extension-ref": extension_name} if extension_name else {}
-                ),
-            },
-            "routing": {"mode": "auto", "pathOverrides": {}},
-            "roles": {"mode": "auto", "include": DEFAULT_ROLES.copy()},
-            "scenarios": {"variables": {}, "overrides": [], "additional": []},
-            "execution": {
-                "resourcePrefix": sanitize_name(extension_name or project.name) + "-e2e",
-                "timeout": "10m",
-                "roleAggregationWait": "30s",
-                "cleanup": "always",
-                "tenants": {"workspaces": 2, "namespacesPerWorkspace": 1},
-            },
-            "report": {
-                "directory": "./test-results",
-                "plan": "kse-e2e-plan.json",
-                "json": "kse-e2e-report.json",
-                "markdown": "kse-e2e-report.md",
-            },
+            "backendCode": backend_code,
+        },
+        "discovery": {
+            "extensionName": extension_name,
+            "roleTemplateSelector": (
+                {"kubesphere.io/extension-ref": extension_name} if extension_name else {}
+            ),
+        },
+        "routing": {"mode": "auto", "pathOverrides": {}},
+        "roles": {"mode": "auto", "include": DEFAULT_ROLES.copy()},
+        "scenarios": {"variables": {}, "overrides": [], "additional": []},
+        "execution": {
+            "resourcePrefix": sanitize_name(extension_name or project.name) + "-e2e",
+            "timeout": "10m",
+            "roleAggregationWait": "30s",
+            "cleanup": "always",
+            "tenants": {"workspaces": 2, "namespacesPerWorkspace": 1},
+        },
+        "report": {
+            "directory": "./test-results",
+            "plan": "kse-e2e-plan.json",
+            "json": "kse-e2e-report.json",
+            "markdown": "kse-e2e-report.md",
         },
     }
     output.write_text(dump_yaml(config), encoding="utf-8")
     os.chmod(output, 0o600)
     add_gitignore(project)
     print(f"Created {output}")
-    print(dump_yaml(redact({"target": config["spec"]["target"], "auth": config["spec"]["auth"]})).strip())
+    print(dump_yaml(redact({"target": config["target"], "auth": config["auth"]})).strip())
 
 
 def load_config(path_value: str) -> tuple[Path, dict[str, Any]]:
@@ -527,46 +523,45 @@ def load_config(path_value: str) -> tuple[Path, dict[str, Any]]:
     config = load_yaml(path)
     if not isinstance(config, dict):
         raise E2EError("configuration root must be a YAML object")
-    if config.get("apiVersion") != CONFIG_API_VERSION or config.get("kind") != CONFIG_KIND:
-        raise E2EError(f"configuration must use apiVersion {CONFIG_API_VERSION} and kind {CONFIG_KIND}")
+    if any(key in config for key in ("apiVersion", "kind", "metadata", "spec")):
+        raise E2EError("configuration must use the plain YAML schema; Kubernetes-style fields are not supported")
+    if config.get("schemaVersion") != CONFIG_SCHEMA_VERSION:
+        raise E2EError(f"configuration schemaVersion must be {CONFIG_SCHEMA_VERSION}")
     return path, config
 
 
 def validate_config_shape(path: Path, config: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    spec = config.get("spec")
-    if not isinstance(spec, dict):
-        return ["spec must be an object"]
-    server = nested(config, "spec", "target", "ksAPIServer", default="")
+    server = nested(config, "target", "ksAPIServer", default="")
     parsed = urllib.parse.urlparse(str(server))
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        errors.append("spec.target.ksAPIServer must be an http or https URL")
-    if not nested(config, "spec", "target", "cluster", default=""):
-        errors.append("spec.target.cluster is required")
+        errors.append("target.ksAPIServer must be an http or https URL")
+    if not nested(config, "target", "cluster", default=""):
+        errors.append("target.cluster is required")
 
-    auth = nested(config, "spec", "auth", default={}) or {}
+    auth = nested(config, "auth", default={}) or {}
     mode = auth.get("mode", "auto")
     if mode not in ("auto", "token", "password"):
-        errors.append("spec.auth.mode must be auto, token, or password")
+        errors.append("auth.mode must be auto, token, or password")
     if mode == "token" and not auth.get("adminToken"):
-        errors.append("spec.auth.adminToken is required in token mode")
+        errors.append("auth.adminToken is required in token mode")
     if mode == "password" and (not auth.get("adminUsername") or not auth.get("adminPassword")):
-        errors.append("spec.auth.adminUsername and adminPassword are required in password mode")
+        errors.append("auth.adminUsername and adminPassword are required in password mode")
     if mode == "auto" and not auth.get("adminToken") and (
         not auth.get("adminUsername") or not auth.get("adminPassword")
     ):
         errors.append("auto authentication requires adminToken or adminUsername/adminPassword")
 
-    docs = nested(config, "spec", "sources", "apiDocs", default=[])
+    docs = nested(config, "sources", "apiDocs", default=[])
     if not isinstance(docs, list) or not docs:
-        errors.append("spec.sources.apiDocs must contain at least one document")
+        errors.append("sources.apiDocs must contain at least one document")
     else:
         for item in docs:
             raw = item.get("path", "") if isinstance(item, dict) else ""
             if not raw or not resolve(path, raw).is_file():
                 errors.append(f"API document does not exist: {raw or '<empty>'}")
 
-    extension = nested(config, "spec", "sources", "extension", default={}) or {}
+    extension = nested(config, "sources", "extension", default={}) or {}
     extension_path = resolve(path, str(extension.get("path", "")))
     if not extension_path.is_dir():
         errors.append(f"extension path does not exist: {extension_path}")
@@ -582,7 +577,7 @@ def validate_config_shape(path: Path, config: dict[str, Any]) -> list[str]:
         errors.append(str(exc))
         sources = []
     if not sources:
-        errors.append("spec.sources.backendCode must contain at least one backend source")
+        errors.append("sources.backendCode must contain at least one backend source")
     for index, source in enumerate(sources):
         root = source["path"]
         if not root.is_dir():
@@ -590,23 +585,23 @@ def validate_config_shape(path: Path, config: dict[str, Any]) -> list[str]:
             continue
         if source["language"] not in (*LANGUAGE_MARKERS, "unknown"):
             errors.append(
-                f"spec.sources.backendCode[{index}].language must be auto, go, java, python, or node"
+                f"sources.backendCode[{index}].language must be auto, go, java, python, or node"
             )
         for field in ("include", "exclude"):
             if not isinstance(source[field], list):
-                errors.append(f"spec.sources.backendCode[{index}].{field} must be a list")
+                errors.append(f"sources.backendCode[{index}].{field} must be a list")
 
-    execution = nested(config, "spec", "execution", default={}) or {}
+    execution = nested(config, "execution", default={}) or {}
     try:
-        duration_seconds(execution.get("timeout", "10m"), "spec.execution.timeout")
-        duration_seconds(execution.get("roleAggregationWait", "30s"), "spec.execution.roleAggregationWait")
+        duration_seconds(execution.get("timeout", "10m"), "execution.timeout")
+        duration_seconds(execution.get("roleAggregationWait", "30s"), "execution.roleAggregationWait")
     except E2EError as exc:
         errors.append(str(exc))
     if execution.get("cleanup", "always") not in ("always", "never"):
-        errors.append("spec.execution.cleanup must be always or never")
-    scenarios = nested(config, "spec", "scenarios", default={}) or {}
+        errors.append("execution.cleanup must be always or never")
+    scenarios = nested(config, "scenarios", default={}) or {}
     if not isinstance(scenarios, dict):
-        errors.append("spec.scenarios must be an object")
+        errors.append("scenarios must be an object")
     else:
         errors.extend(validate_scenarios(path, config, scenarios))
     return errors
@@ -616,12 +611,12 @@ def validate_scenarios(path: Path, config: dict[str, Any], scenarios: dict[str, 
     errors: list[str] = []
     for field in ("overrides", "additional"):
         if not isinstance(scenarios.get(field, []), list):
-            errors.append(f"spec.scenarios.{field} must be a list")
+            errors.append(f"scenarios.{field} must be a list")
     if not isinstance(scenarios.get("variables", {}), dict):
-        errors.append("spec.scenarios.variables must be an object")
+        errors.append("scenarios.variables must be an object")
     overrides = scenarios.get("overrides", []) if isinstance(scenarios.get("overrides", []), list) else []
     for index, override in enumerate(overrides):
-        prefix = f"spec.scenarios.overrides[{index}]"
+        prefix = f"scenarios.overrides[{index}]"
         if not isinstance(override, dict):
             errors.append(f"{prefix} must be an object")
             continue
@@ -630,9 +625,9 @@ def validate_scenarios(path: Path, config: dict[str, Any], scenarios: dict[str, 
         errors.extend(validate_evidence(prefix, override.get("evidence", []), path))
     additional = scenarios.get("additional", []) if isinstance(scenarios.get("additional", []), list) else []
     identifiers: list[str] = []
-    roles = set(nested(config, "spec", "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES)
+    roles = set(nested(config, "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES)
     for index, scenario in enumerate(additional):
-        prefix = f"spec.scenarios.additional[{index}]"
+        prefix = f"scenarios.additional[{index}]"
         if not isinstance(scenario, dict):
             errors.append(f"{prefix} must be an object")
             continue
@@ -735,7 +730,7 @@ def order_scenarios(scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def choose_auth(config: dict[str, Any]) -> str:
-    auth = nested(config, "spec", "auth", default={}) or {}
+    auth = nested(config, "auth", default={}) or {}
     mode = auth.get("mode", "auto")
     if mode == "token" or (mode == "auto" and auth.get("adminToken")):
         return "token"
@@ -743,13 +738,13 @@ def choose_auth(config: dict[str, Any]) -> str:
 
 
 def login(config: dict[str, Any]) -> str:
-    auth = nested(config, "spec", "auth", default={}) or {}
+    auth = nested(config, "auth", default={}) or {}
     if choose_auth(config) == "token":
         return str(auth.get("adminToken", ""))
-    target = nested(config, "spec", "target", default={}) or {}
+    target = nested(config, "target", default={}) or {}
     client = Client(
         str(target["ksAPIServer"]),
-        insecure=bool(nested(config, "spec", "target", "tls", "insecureSkipVerify", default=False)),
+        insecure=bool(nested(config, "target", "tls", "insecureSkipVerify", default=False)),
     )
     body = {
         "grant_type": "password",
@@ -790,7 +785,7 @@ def extract_token(value: Any) -> str:
 
 
 def renderer_command(path: Path, config: dict[str, Any]) -> tuple[str, list[str]]:
-    extension = nested(config, "spec", "sources", "extension", default={}) or {}
+    extension = nested(config, "sources", "extension", default={}) or {}
     root = resolve(path, str(extension.get("path", "")))
     renderer = extension.get("renderer", "auto")
     if renderer == "auto":
@@ -861,7 +856,7 @@ def merge_dict(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]
 
 
 def render_extension_children(path: Path, config: dict[str, Any]) -> subprocess.CompletedProcess[str]:
-    extension = nested(config, "spec", "sources", "extension", default={}) or {}
+    extension = nested(config, "sources", "extension", default={}) or {}
     root = resolve(path, str(extension.get("path", "")))
     metadata = load_yaml(root / "extension.yaml") or {}
     dependency_names = [
@@ -970,9 +965,9 @@ def infer_api(path: str, operation: dict[str, Any], method: str) -> dict[str, st
 
 
 def load_operations(path: Path, config: dict[str, Any]) -> list[dict[str, Any]]:
-    overrides = nested(config, "spec", "routing", "pathOverrides", default={}) or {}
+    overrides = nested(config, "routing", "pathOverrides", default={}) or {}
     operations: list[dict[str, Any]] = []
-    docs = nested(config, "spec", "sources", "apiDocs", default=[]) or []
+    docs = nested(config, "sources", "apiDocs", default=[]) or []
     for source in docs:
         doc_path = resolve(path, str(source["path"]))
         document = load_document(doc_path)
@@ -1085,7 +1080,7 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
             operation["requestPath"] = str(fixture["requestPath"])
         if fixture and fixture.get("evidence"):
             operation["evidence"] = fixture["evidence"]
-    roles = nested(config, "spec", "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES
+    roles = nested(config, "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES
     matrix = []
     for operation in operations:
         for role in roles:
@@ -1106,7 +1101,7 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
     needs_configuration = [
         {
             "operationId": operation["operationId"],
-            "reason": "write operation needs a valid request body in spec.scenarios.overrides",
+            "reason": "write operation needs a valid request body in scenarios.overrides",
         }
         for operation in operations
         if operation["method"] != "GET" and fixture_for(scenarios, operation) is None
@@ -1141,21 +1136,21 @@ def roletemplate_summary(template: dict[str, Any]) -> dict[str, Any]:
 
 def sanitized_summary(config: dict[str, Any]) -> dict[str, Any]:
     return {
-        "ksAPIServer": nested(config, "spec", "target", "ksAPIServer", default=""),
-        "cluster": nested(config, "spec", "target", "cluster", default=""),
+        "ksAPIServer": nested(config, "target", "ksAPIServer", default=""),
+        "cluster": nested(config, "target", "cluster", default=""),
         "authenticationMode": choose_auth(config),
-        "adminUsername": nested(config, "spec", "auth", "adminUsername", default=""),
-        "roles": nested(config, "spec", "roles", "include", default=DEFAULT_ROLES),
+        "adminUsername": nested(config, "auth", "adminUsername", default=""),
+        "roles": nested(config, "roles", "include", default=DEFAULT_ROLES),
         "backendCode": [
             {
                 "name": item.get("name", ""),
                 "path": item.get("path", ""),
                 "language": item.get("language", "auto"),
             }
-            for item in (nested(config, "spec", "sources", "backendCode", default=[]) or [])
+            for item in (nested(config, "sources", "backendCode", default=[]) or [])
             if isinstance(item, dict)
         ],
-        "cleanup": nested(config, "spec", "execution", "cleanup", default="always"),
+        "cleanup": nested(config, "execution", "cleanup", default="always"),
     }
 
 
@@ -1167,11 +1162,11 @@ def validate_command(args: argparse.Namespace) -> None:
     renderer, templates = render_roletemplates(path, config)
     operations = load_operations(path, config)
     token = login(config)
-    target = nested(config, "spec", "target", default={}) or {}
+    target = nested(config, "target", default={}) or {}
     client = Client(
         str(target["ksAPIServer"]),
         token,
-        bool(nested(config, "spec", "target", "tls", "insecureSkipVerify", default=False)),
+        bool(nested(config, "target", "tls", "insecureSkipVerify", default=False)),
     )
     response = client.request("GET", "/apis/iam.kubesphere.io/v1beta1/roletemplates?limit=1")
     if response.status >= 400:
@@ -1204,8 +1199,8 @@ def plan_command(args: argparse.Namespace) -> None:
     if errors:
         raise E2EError("configuration validation failed:\n- " + "\n- ".join(errors))
     plan = build_plan(path, config)
-    report_directory = resolve(path, nested(config, "spec", "report", "directory", default="./test-results"))
-    default_plan = report_directory / str(nested(config, "spec", "report", "plan", default="kse-e2e-plan.json"))
+    report_directory = resolve(path, nested(config, "report", "directory", default="./test-results"))
+    default_plan = report_directory / str(nested(config, "report", "plan", default="kse-e2e-plan.json"))
     output = Path(args.output).resolve() if args.output else default_plan
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
@@ -1267,15 +1262,15 @@ def wait_ready(client: Client, paths: list[str], timeout: float) -> None:
 
 
 def prepare_environment(config_path: Path, config: dict[str, Any], admin: Client, run_id: str) -> tuple[dict[str, Any], dict[str, Client]]:
-    prefix = sanitize_name(nested(config, "spec", "execution", "resourcePrefix", default="extension-e2e"))
+    prefix = sanitize_name(nested(config, "execution", "resourcePrefix", default="extension-e2e"))
     suffix = run_id.rsplit("-", 1)[-1]
     workspace = f"{prefix}-{suffix}-a"
     other_workspace = f"{prefix}-{suffix}-b"
     namespace = f"{prefix}-{suffix}-a"
     other_namespace = f"{prefix}-{suffix}-b"
-    cluster = str(nested(config, "spec", "target", "cluster", default="host"))
-    manager = str(nested(config, "spec", "auth", "adminUsername", default="admin"))
-    roles = nested(config, "spec", "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES
+    cluster = str(nested(config, "target", "cluster", default="host"))
+    manager = str(nested(config, "auth", "adminUsername", default="admin"))
+    roles = nested(config, "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES
     state: dict[str, Any] = {
         "runID": run_id,
         "createdAt": utc_now(),
@@ -1324,8 +1319,8 @@ def prepare_environment(config_path: Path, config: dict[str, Any], admin: Client
         save_state(state_path, state)
 
     wait_timeout = duration_seconds(
-        nested(config, "spec", "execution", "roleAggregationWait", default="30s"),
-        "spec.execution.roleAggregationWait",
+        nested(config, "execution", "roleAggregationWait", default="30s"),
+        "execution.roleAggregationWait",
     )
     role_paths: list[str] = []
     if any(role.startswith("workspace-") for role in roles):
@@ -1418,10 +1413,10 @@ def bind_test_role(
 
 def login_user(config: dict[str, Any], username: str, password: str, timeout: float = 30) -> str:
     copy = json.loads(json.dumps(config))
-    copy["spec"]["auth"]["mode"] = "password"
-    copy["spec"]["auth"]["adminUsername"] = username
-    copy["spec"]["auth"]["adminPassword"] = password
-    copy["spec"]["auth"]["adminToken"] = ""
+    copy["auth"]["mode"] = "password"
+    copy["auth"]["adminUsername"] = username
+    copy["auth"]["adminPassword"] = password
+    copy["auth"]["adminToken"] = ""
     deadline = time.monotonic() + timeout
     last_error = ""
     while time.monotonic() < deadline:
@@ -1434,7 +1429,7 @@ def login_user(config: dict[str, Any], username: str, password: str, timeout: fl
 
 
 def state_file(config_path: Path, config: dict[str, Any], run_id: str) -> Path:
-    directory = resolve(config_path, nested(config, "spec", "report", "directory", default="./test-results"))
+    directory = resolve(config_path, nested(config, "report", "directory", default="./test-results"))
     return directory / f".kse-e2e-state-{run_id}.json"
 
 
@@ -1461,16 +1456,16 @@ def substitute(value: Any, variables: dict[str, str]) -> Any:
 
 
 def load_scenarios(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
-    configured = nested(config, "spec", "scenarios", default={}) or {}
+    configured = nested(config, "scenarios", default={}) or {}
     if not isinstance(configured, dict):
-        raise E2EError("spec.scenarios must be an object")
+        raise E2EError("scenarios must be an object")
     result = {
         "variables": dict(configured.get("variables", {}) or {}),
         "operations": list(configured.get("overrides", []) or []),
         "additional": list(configured.get("additional", []) or []),
     }
     # Backward-compatible import for configurations created by the first release.
-    raw = nested(config, "spec", "fixtures", "file", default="")
+    raw = nested(config, "fixtures", "file", default="")
     if raw:
         value = load_yaml(resolve(config_path, str(raw)))
         if not isinstance(value, dict):
@@ -1545,7 +1540,7 @@ def diagnose(expected: str, response: HTTPResponse | None, error: str, diagnosti
 
 
 def compare_live_templates(admin: Client, config: dict[str, Any], source: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selector = nested(config, "spec", "discovery", "roleTemplateSelector", default={}) or {}
+    selector = nested(config, "discovery", "roleTemplateSelector", default={}) or {}
     query = ""
     if selector:
         query = "?" + urllib.parse.urlencode({"labelSelector": ",".join(f"{key}={value}" for key, value in selector.items())})
@@ -1875,7 +1870,7 @@ def execute_scenarios(
                     "error": error,
                     "likelyFailureLayer": "configuration" if needs_configuration else "scenario setup",
                     "suggestion": (
-                        "add the named values to spec.scenarios.variables"
+                        "add the named values to scenarios.variables"
                         if needs_configuration
                         else "check setup dependencies, request bodies, and source-derived assumptions"
                     ),
@@ -2092,7 +2087,7 @@ def cleanup_state(admin: Client, state: dict[str, Any], timeout: float = 30) -> 
 
 
 def report_paths(config_path: Path, config: dict[str, Any]) -> tuple[Path, Path]:
-    report = nested(config, "spec", "report", default={}) or {}
+    report = nested(config, "report", default={}) or {}
     directory = resolve(config_path, str(report.get("directory", "./test-results")))
     return directory / str(report.get("json", "kse-e2e-report.json")), directory / str(report.get("markdown", "kse-e2e-report.md"))
 
@@ -2167,12 +2162,12 @@ def run_command(args: argparse.Namespace) -> None:
     print(json.dumps({"preflight": sanitized_summary(config)}, indent=2, ensure_ascii=False))
     started = time.monotonic()
     run_id = sanitize_name(
-        f"{nested(config, 'spec', 'execution', 'resourcePrefix', default='extension-e2e')}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}"
+        f"{nested(config, 'execution', 'resourcePrefix', default='extension-e2e')}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}"
     )
     report: dict[str, Any] = {
         "runID": run_id,
         "startedAt": utc_now(),
-        "target": nested(config, "spec", "target", default={}),
+        "target": nested(config, "target", default={}),
         "authenticationMode": choose_auth(config),
         "setupErrors": [],
         "cleanupErrors": [],
@@ -2182,11 +2177,11 @@ def run_command(args: argparse.Namespace) -> None:
     admin = None
     try:
         token = login(config)
-        target = nested(config, "spec", "target", default={}) or {}
+        target = nested(config, "target", default={}) or {}
         admin = Client(
             str(target["ksAPIServer"]),
             token,
-            bool(nested(config, "spec", "target", "tls", "insecureSkipVerify", default=False)),
+            bool(nested(config, "target", "tls", "insecureSkipVerify", default=False)),
         )
         plan = build_plan(config_path, config)
         report["renderer"] = plan["renderer"]
@@ -2203,7 +2198,7 @@ def run_command(args: argparse.Namespace) -> None:
             admin,
             source_templates,
             state,
-            nested(config, "spec", "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES,
+            nested(config, "roles", "include", default=DEFAULT_ROLES) or DEFAULT_ROLES,
         )
         report["results"] = execute_matrix(plan, config_path, config, state, clients)
         report["results"].extend(execute_scenarios(plan, config_path, config, state, admin, clients))
@@ -2216,7 +2211,7 @@ def run_command(args: argparse.Namespace) -> None:
                 state = json.loads(state_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 pass
-        if state is not None and admin is not None and nested(config, "spec", "execution", "cleanup", default="always") == "always":
+        if state is not None and admin is not None and nested(config, "execution", "cleanup", default="always") == "always":
             report["cleanupErrors"] = cleanup_state(admin, state)
             if not report["cleanupErrors"] and state_path.exists():
                 state_path.unlink()
@@ -2235,11 +2230,11 @@ def cleanup_command(args: argparse.Namespace) -> None:
         raise E2EError(f"run state does not exist: {path}")
     state = json.loads(path.read_text(encoding="utf-8"))
     token = login(config)
-    target = nested(config, "spec", "target", default={}) or {}
+    target = nested(config, "target", default={}) or {}
     admin = Client(
         str(target["ksAPIServer"]),
         token,
-        bool(nested(config, "spec", "target", "tls", "insecureSkipVerify", default=False)),
+        bool(nested(config, "target", "tls", "insecureSkipVerify", default=False)),
     )
     errors = cleanup_state(admin, state)
     if errors:

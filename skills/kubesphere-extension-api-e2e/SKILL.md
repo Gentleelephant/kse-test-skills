@@ -17,9 +17,9 @@ or focused 401/403 diagnosis.
 - Work from the extension project root.
 - The only user-maintained configuration is `./kse-e2e.yaml`.
 - Resolve every relative path from that file's directory.
-- Read every configured `spec.sources.backendCode` tree without modifying it.
+- Read every configured `sources.backendCode` tree without modifying it.
 - Write generated plans, reports, and recovery state only below
-  `spec.report.directory`.
+  `report.directory`.
 - Treat the runner as the deterministic executor. The Agent, not regex
   heuristics, interprets arbitrary backend business semantics.
 
@@ -39,7 +39,7 @@ Read `references/configuration.md` when creating or changing configuration.
    RoleTemplates, route/SAR code, handlers, services, admission, models, and
    errors in that order.
 3. Express source-derived write bodies and business rules in
-   `spec.scenarios.overrides` and `spec.scenarios.additional`. Read
+   `scenarios.overrides` and `scenarios.additional`. Read
    `references/scenario-schema.md` before editing them. Every derived scenario
    must cite API, RoleTemplate, or source file/line evidence and its certainty.
 4. Run `plan`. Review every `needsConfiguration` item; fill only facts that

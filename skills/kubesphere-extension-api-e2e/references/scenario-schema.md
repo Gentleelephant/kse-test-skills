@@ -13,26 +13,25 @@
 Overrides attach valid data to a documented operation:
 
 ```yaml
-spec:
-  scenarios:
-    variables:
-      widgetName: sample-widget
-    overrides:
-      - operationId: createWidget
-        sar:
-          group: example.io
-          version: v1
-          resource: widgets
-          verb: create
-          scope: workspace
-        body:
-          metadata:
-            name: ${widgetName}-${role}
-        expectedSuccess: [200, 201]
-        cleanupPath: /kapis/example.io/v1/workspaces/{workspace}/widgets/${widgetName}-${role}
-        assertions:
-          - path: metadata.name
-            equals: ${widgetName}-${role}
+scenarios:
+  variables:
+    widgetName: sample-widget
+  overrides:
+    - operationId: createWidget
+      sar:
+        group: example.io
+        version: v1
+        resource: widgets
+        verb: create
+        scope: workspace
+      body:
+        metadata:
+          name: ${widgetName}-${role}
+      expectedSuccess: [200, 201]
+      cleanupPath: /kapis/example.io/v1/workspaces/{workspace}/widgets/${widgetName}-${role}
+      assertions:
+        - path: metadata.name
+          equals: ${widgetName}-${role}
 ```
 
 Select by `operationId`, or by exact `method` and `path`. `requestPath` may
@@ -124,7 +123,7 @@ Represent an unresolved scenario explicitly:
 ```yaml
 - id: create-provider-backed-resource
   status: NEEDS_CONFIGURATION
-  reason: set spec.scenarios.variables.providerID
+  reason: set scenarios.variables.providerID
   evidence:
     - type: source
       reference: ./pkg/providers/create.go:51

@@ -25,14 +25,20 @@ Gradle files, `pyproject.toml`, `requirements.txt`, `setup.py`, or
 
 Use `assets/kse-e2e.example.yaml` as the complete schema example.
 
+The file is plain YAML consumed by the Agent and runner. `schemaVersion: 1`
+identifies this configuration contract; it is not a Kubernetes object and
+does not use `apiVersion`, `kind`, `metadata`, or `spec`.
+
 ## Required Fields
 
-- `spec.target.ksAPIServer`: KubeSphere API server aggregation endpoint.
-- `spec.target.cluster`: cluster used by temporary WorkspaceTemplates.
-- `spec.auth`: token or username/password credentials.
-- `spec.sources.apiDocs[].path`: Swagger 2 or OpenAPI 3 JSON/YAML.
-- `spec.sources.extension.path`: extension root or Helm chart.
-- `spec.sources.backendCode[].path`: one or more readable backend source roots.
+- `schemaVersion`: must be `1`.
+- `name`: local test configuration name.
+- `target.ksAPIServer`: KubeSphere API server aggregation endpoint.
+- `target.cluster`: cluster used by temporary WorkspaceTemplates.
+- `auth`: token or username/password credentials.
+- `sources.apiDocs[].path`: Swagger 2 or OpenAPI 3 JSON/YAML.
+- `sources.extension.path`: extension root or Helm chart.
+- `sources.backendCode[].path`: one or more readable backend source roots.
 
 `renderer: auto` prefers `ksbuilder` for `extension.yaml` and Helm for
 `Chart.yaml`. Values files are passed to the renderer. Older ksbuilder
@@ -55,19 +61,19 @@ executed by source analysis.
 
 ## Scenario And Execution Configuration
 
-`spec.scenarios.variables` contains values not discoverable from sources or the
+`scenarios.variables` contains values not discoverable from sources or the
 cluster. `overrides` supplies valid bodies or corrected SAR metadata for
 documented operations. `additional` describes dependency, isolation, response
 shaping, and business-rejection scenarios.
 
 Generated output is controlled by:
 
-- `spec.report.directory`
-- `spec.report.plan`
-- `spec.report.json`
-- `spec.report.markdown`
+- `report.directory`
+- `report.plan`
+- `report.json`
+- `report.markdown`
 
-Temporary resources use `spec.execution.resourcePrefix` plus a run ID. Cleanup
+Temporary resources use `execution.resourcePrefix` plus a run ID. Cleanup
 is `always` or `never`; `always` is the default.
 
 ## Authentication And Safety

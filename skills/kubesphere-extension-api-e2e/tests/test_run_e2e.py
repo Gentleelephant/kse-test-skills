@@ -41,7 +41,11 @@ def roletemplate(name: str, scope: str, labels: list[str], verbs: list[str]) -> 
 class RunnerTests(unittest.TestCase):
     def test_example_config_contains_no_credentials(self) -> None:
         example = e2e.load_yaml(SCRIPT.parents[1] / "assets" / "kse-e2e.example.yaml")
-        auth = example["spec"]["auth"]
+        auth = example["auth"]
+        self.assertEqual(example["schemaVersion"], 1)
+        self.assertNotIn("apiVersion", example)
+        self.assertNotIn("kind", example)
+        self.assertNotIn("spec", example)
         self.assertEqual(auth["adminPassword"], "")
         self.assertEqual(auth["adminToken"], "")
 
@@ -165,10 +169,8 @@ class RunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             config = {
-                "spec": {
-                    "sources": {"apiDocs": [{"path": "./openapi.json"}]},
-                    "routing": {"pathOverrides": {}},
-                }
+                "sources": {"apiDocs": [{"path": "./openapi.json"}]},
+                "routing": {"pathOverrides": {}},
             }
             operations = e2e.load_operations(root / "kse-e2e.yaml", config)
             self.assertEqual(len({item["operationKey"] for item in operations}), 2)
@@ -196,10 +198,8 @@ class RunnerTests(unittest.TestCase):
 
     def test_secret_values_include_scenario_secrets(self) -> None:
         config = {
-            "spec": {
-                "auth": {"adminPassword": "admin-secret"},
-                "scenarios": {"variables": {"providerSecret": "provider-secret"}},
-            }
+            "auth": {"adminPassword": "admin-secret"},
+            "scenarios": {"variables": {"providerSecret": "provider-secret"}},
         }
         self.assertEqual(
             set(e2e.secret_values(config)),
@@ -208,11 +208,9 @@ class RunnerTests(unittest.TestCase):
 
     def test_public_value_matching_secret_does_not_corrupt_api_group(self) -> None:
         config = {
-            "spec": {
-                "auth": {
-                    "oauthClientID": "kubesphere",
-                    "oauthClientSecret": "kubesphere",
-                }
+            "auth": {
+                "oauthClientID": "kubesphere",
+                "oauthClientSecret": "kubesphere",
             }
         }
         value = {
@@ -263,33 +261,29 @@ class RunnerTests(unittest.TestCase):
 
     def test_token_has_priority_in_auto_mode(self) -> None:
         config = {
-            "spec": {
-                "auth": {
-                    "mode": "auto",
-                    "adminUsername": "admin",
-                    "adminPassword": "password",
-                    "adminToken": "token",
-                }
+            "auth": {
+                "mode": "auto",
+                "adminUsername": "admin",
+                "adminPassword": "password",
+                "adminToken": "token",
             }
         }
         self.assertEqual(e2e.choose_auth(config), "token")
 
     def test_password_login_extracts_token_without_logging_credentials(self) -> None:
         config = {
-            "spec": {
-                "target": {
-                    "ksAPIServer": "http://127.0.0.1:1",
-                    "tls": {"insecureSkipVerify": False},
-                },
-                "auth": {
-                    "mode": "password",
-                    "adminUsername": "admin",
-                    "adminPassword": "secret-password",
-                    "loginPath": "/oauth/token",
-                    "oauthClientID": "kubesphere",
-                    "oauthClientSecret": "secret-client",
-                },
-            }
+            "target": {
+                "ksAPIServer": "http://127.0.0.1:1",
+                "tls": {"insecureSkipVerify": False},
+            },
+            "auth": {
+                "mode": "password",
+                "adminUsername": "admin",
+                "adminPassword": "secret-password",
+                "loginPath": "/oauth/token",
+                "oauthClientID": "kubesphere",
+                "oauthClientSecret": "secret-client",
+            },
         }
         response = e2e.HTTPResponse(200, '{"access_token":"issued-token"}', {})
         with mock.patch.object(e2e.Client, "request", return_value=response):
@@ -325,10 +319,35 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
             self.assertIn("/kse-e2e.yaml", (project / ".gitignore").read_text(encoding="utf-8"))
             loaded = e2e.load_yaml(config)
-            self.assertEqual(loaded["spec"]["auth"]["adminPassword"], "test-password")
-            self.assertEqual(loaded["spec"]["sources"]["apiDocs"][0]["path"], "./apidocs.json")
-            self.assertEqual(loaded["spec"]["sources"]["backendCode"][0]["language"], "go")
-            self.assertEqual(loaded["spec"]["sources"]["backendCode"][0]["path"], ".")
+            self.assertEqual(loaded["schemaVersion"], 1)
+            self.assertEqual(loaded["auth"]["adminPassword"], "test-password")
+            self.assertEqual(loaded["sources"]["apiDocs"][0]["path"], "./apidocs.json")
+            self.assertEqual(loaded["sources"]["backendCode"][0]["language"], "go")
+            self.assertEqual(loaded["sources"]["backendCode"][0]["path"], ".")
+            self.assertNotIn("spec", loaded)
+
+    def test_load_config_rejects_kubernetes_style_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "kse-e2e.yaml"
+            config.write_text(
+                "apiVersion: testing.kubesphere.io/v1alpha1\n"
+                "kind: ExtensionAPIE2E\n"
+                "metadata:\n"
+                "  name: old\n"
+                "spec: {}\n",
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            with self.assertRaisesRegex(e2e.E2EError, "Kubernetes-style"):
+                e2e.load_config(str(config))
+
+    def test_load_config_accepts_plain_yaml_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "kse-e2e.yaml"
+            config.write_text("schemaVersion: 1\nname: demo\n", encoding="utf-8")
+            config.chmod(0o600)
+            _, loaded = e2e.load_config(str(config))
+            self.assertEqual(loaded, {"schemaVersion": 1, "name": "demo"})
 
     def test_backend_source_inventory_honors_include_and_exclude(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -339,18 +358,16 @@ class RunnerTests(unittest.TestCase):
             (root / "pkg" / "notes.md").write_text("not source\n", encoding="utf-8")
             (root / "vendor" / "ignored.go").write_text("package ignored\n", encoding="utf-8")
             config = {
-                "spec": {
-                    "sources": {
-                        "backendCode": [
-                            {
-                                "name": "demo",
-                                "path": ".",
-                                "language": "go",
-                                "include": ["./pkg", "./vendor"],
-                                "exclude": ["./vendor"],
-                            }
-                        ]
-                    }
+                "sources": {
+                    "backendCode": [
+                        {
+                            "name": "demo",
+                            "path": ".",
+                            "language": "go",
+                            "include": ["./pkg", "./vendor"],
+                            "exclude": ["./vendor"],
+                        }
+                    ]
                 }
             }
             inventory = e2e.source_inventory(root / "kse-e2e.yaml", config)
@@ -430,10 +447,8 @@ class RunnerTests(unittest.TestCase):
             )
             config_path = root / "kse-e2e.yaml"
             config = {
-                "spec": {
-                    "sources": {"apiDocs": [{"path": "./openapi.json"}]},
-                    "routing": {"pathOverrides": {}},
-                }
+                "sources": {"apiDocs": [{"path": "./openapi.json"}]},
+                "routing": {"pathOverrides": {}},
             }
             operations = e2e.load_operations(config_path, config)
             self.assertEqual(len(operations), 1)
@@ -484,10 +499,8 @@ class RunnerTests(unittest.TestCase):
             root = Path(directory)
             config_path = root / "kse-e2e.yaml"
             config = {
-                "spec": {
-                    "report": {"directory": "./test-results"},
-                    "scenarios": {"variables": {}, "overrides": [], "additional": []},
-                }
+                "report": {"directory": "./test-results"},
+                "scenarios": {"variables": {}, "overrides": [], "additional": []},
             }
             state = {
                 "runID": "run-1",
@@ -544,10 +557,8 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = {
-                "spec": {
-                    "report": {"directory": "./test-results"},
-                    "scenarios": {"variables": {}, "overrides": [], "additional": []},
-                }
+                "report": {"directory": "./test-results"},
+                "scenarios": {"variables": {}, "overrides": [], "additional": []},
             }
             state = {"runID": "run-1", "variables": {}, "resources": []}
             actor = mock.Mock()

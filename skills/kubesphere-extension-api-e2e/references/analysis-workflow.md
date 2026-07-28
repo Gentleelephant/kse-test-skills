@@ -10,7 +10,7 @@
 
 ## Evidence Order
 
-Analyze only paths declared in `spec.sources`. Use this order:
+Analyze only paths declared in `sources`. Use this order:
 
 1. API documents: operations, schemas, examples, documented statuses.
 2. Rendered RoleTemplates: scope, rules, aggregation labels, resource names.
@@ -71,7 +71,7 @@ additional scenario should contain:
   `certainty: inferred`.
 
 If a runtime value cannot be derived, create a `NEEDS_CONFIGURATION` scenario
-whose reason names the exact missing `spec.scenarios.variables` key.
+whose reason names the exact missing `scenarios.variables` key.
 
 ## Confidence Rules
 
