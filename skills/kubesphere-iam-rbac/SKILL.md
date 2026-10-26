@@ -71,14 +71,19 @@ already confirmed.
 
 - The API, RoleTemplate, aggregated role, user, and binding are all identified.
 - Writes are read back; cleanup is verified with a 404.
-- Expected ALLOW matches 2xx and expected DENY matches 403.
+- Expected ALLOW matches 2xx and expected DENY matches 403, including a
+  no-token control. A request without `Authorization` becomes
+  `system:anonymous` and is denied by RBAC with 403, not 401.
 - 401, 404, 409, and 5xx are diagnosed, not counted as clean authorization evidence.
 - Cluster conclusions are marked `VERIFIED`, `INFERRED`, or `UNVERIFIED`.
 
 ## Common Failures
 
-- `401`: missing, expired, malformed, or wrong-endpoint token; log in again.
+- `401`: expired, malformed, or wrong-endpoint token, wrong Basic password, or
+  an RBAC-excluded route. No token is not a 401; check the endpoint and
+  anonymous authentication instead.
 - `403`: compare RoleTemplate, aggregation, binding, user token, and path scope.
+  A no-token request that reaches this point is behaving correctly.
 - `404`: verify server URL, API discovery, group/version, and route prefix.
 - `409`: read the existing object and decide whether it satisfies setup.
 - `5xx`: inspect ks-apiserver, extension backend, and cluster events; report `PARTIAL`.

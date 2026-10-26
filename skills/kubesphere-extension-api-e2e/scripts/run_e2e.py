@@ -1041,7 +1041,184 @@ def load_operations(path: Path, config: dict[str, Any]) -> list[dict[str, Any]]:
     return operations
 
 
+SCOPE_LABEL = "iam.kubesphere.io/scope"
+MANAGED_LABEL = "kubesphere.io/managed"
+
+
+def _rule(
+    api_groups: list[str] | None = None,
+    resources: list[str] | None = None,
+    verbs: list[str] | None = None,
+    non_resource_urls: list[str] | None = None,
+    resource_names: list[str] | None = None,
+) -> dict[str, Any]:
+    rule: dict[str, Any] = {}
+    if non_resource_urls is not None:
+        rule["nonResourceURLs"] = list(non_resource_urls)
+    else:
+        rule["apiGroups"] = list(api_groups or [])
+        rule["resources"] = list(resources or [])
+        if resource_names:
+            rule["resourceNames"] = list(resource_names)
+    rule["verbs"] = list(verbs or [])
+    return rule
+
+
+def _allow_all_rules() -> list[dict[str, Any]]:
+    return [
+        _rule(["*"], ["*"], ["*"]),
+        _rule(verbs=["*"], non_resource_urls=["*"]),
+    ]
+
+
+# Base rules and aggregation selectors of the KSE builtin roles.
+#
+# Source: kse/config/ks-core/templates/{clusterroles,globalroles,builtinroles}.yaml.
+# `selector` holds the labels from aggregationRoleTemplates.roleSelector. The
+# RoleTemplate controller merges iam.kubesphere.io/scope into that selector
+# (pkg/componenthelper/auth/rbac/helper.go), so a role only aggregates
+# RoleTemplates whose scope equals the role scope. `selector: None` means the
+# role has no aggregation at all.
+#
+# `rules` are the role's own rules. Even when no extension RoleTemplate is
+# aggregated, these rules authorize requests, so an offline expectation must
+# include them (cluster-admin and platform-admin allow everything).
+BUILTIN_ROLES: dict[str, dict[str, Any]] = {
+    "anonymous": {
+        "scope": "global",
+        "selector": None,
+        "rules": [
+            _rule(["config.kubesphere.io"], ["configs"], ["get", "list"]),
+            _rule(verbs=["get"], non_resource_urls=["/static/images/*"]),
+        ],
+    },
+    "authenticated": {
+        "scope": "global",
+        "selector": {"iam.kubesphere.io/aggregate-to-authenticated": ""},
+        "rules": [
+            _rule(["config.kubesphere.io"], ["configs"], ["get", "list"]),
+            _rule(["iam.kubesphere.io"], ["users", "roletemplates", "categories"], ["list"]),
+            _rule(["resources.kubesphere.io"], ["registry", "git"], ["get", "create"]),
+            _rule(["resources.kubesphere.io"], ["clusters"], ["get", "list"]),
+            _rule(["*"], ["storageclasses", "storageclasscapabilities", "nodes"], ["get", "list"]),
+            _rule(["resources.kubesphere.io"], ["namespaces", "services"], ["list"]),
+            _rule(["tenant.kubesphere.io"], ["workspacetemplates"], ["patch"]),
+            _rule(["extensions.kubesphere.io"], ["jsbundles"], ["get", "list"]),
+            _rule(["kubesphere.io"], ["extensions"], ["get", "list"]),
+            _rule(
+                ["application.kubesphere.io"],
+                ["apps", "categories", "apps/versions", "applications"],
+                ["get", "list"],
+            ),
+            _rule(["cluster.kubesphere.io"], ["labels"], ["get", "list"]),
+            _rule(verbs=["get"], non_resource_urls=["/static/images/*"]),
+        ],
+    },
+    "platform-admin": {
+        "scope": "global",
+        "selector": {},
+        "rules": _allow_all_rules(),
+    },
+    "platform-regular": {"scope": "global", "selector": None, "rules": []},
+    "platform-self-provisioner": {
+        "scope": "global",
+        "selector": None,
+        "rules": [_rule(["tenant.kubesphere.io"], ["workspaces", "workspacetemplates"], ["create", "watch"])],
+    },
+    "cluster-admin": {
+        "scope": "cluster",
+        "selector": {},
+        "rules": _allow_all_rules(),
+    },
+    "cluster-viewer": {
+        "scope": "cluster",
+        "selector": {"iam.kubesphere.io/aggregate-to-cluster-viewer": ""},
+        "rules": [
+            _rule(["*"], ["*"], ["get", "list", "watch"]),
+            _rule(verbs=["get"], non_resource_urls=["*"]),
+        ],
+    },
+    "workspace-admin": {
+        "scope": "workspace",
+        "selector": {},
+        "rules": [_rule(["*"], ["*"], ["*"])],
+    },
+    "workspace-viewer": {
+        "scope": "workspace",
+        "selector": {"iam.kubesphere.io/aggregate-to-viewer": ""},
+        "rules": [_rule(["*"], ["*"], ["get", "list", "watch"])],
+    },
+    "workspace-regular": {
+        "scope": "workspace",
+        "selector": {"iam.kubesphere.io/aggregate-to-regular": ""},
+        "rules": [_rule(["*"], ["workspaces", "workspacemembers"], ["get", "list", "watch"])],
+    },
+    "workspace-self-provisioner": {
+        "scope": "workspace",
+        "selector": {"iam.kubesphere.io/aggregate-to-self-provisioner": ""},
+        "rules": [],
+    },
+    "namespace-admin": {
+        "scope": "namespace",
+        "selector": {MANAGED_LABEL: "true"},
+        "rules": [_rule(["*"], ["*"], ["*"])],
+    },
+    "namespace-operator": {
+        "scope": "namespace",
+        "selector": {"iam.kubesphere.io/aggregate-to-operator": "", MANAGED_LABEL: "true"},
+        "rules": [
+            _rule(["*"], ["*"], ["get", "list", "watch"]),
+            _rule(
+                [
+                    "",
+                    "apps",
+                    "extensions",
+                    "batch",
+                    "autoscaling",
+                    "app.k8s.io",
+                    "operations.kubesphere.io",
+                    "resources.kubesphere.io",
+                    "config.istio.io",
+                    "events.k8s.io",
+                    "events.kubesphere.io",
+                    "snapshot.storage.k8s.io",
+                    "networking.k8s.io",
+                ],
+                ["*"],
+                ["*"],
+            ),
+        ],
+    },
+    "namespace-viewer": {
+        "scope": "namespace",
+        "selector": {"iam.kubesphere.io/aggregate-to-viewer": "", MANAGED_LABEL: "true"},
+        "rules": [_rule(["*"], ["*"], ["get", "list", "watch"])],
+    },
+}
+
+# Request scopes reachable from a binding at the given scope. A ClusterRole's
+# rules apply cluster-wide, including namespaced resources; a WorkspaceRole
+# only reaches its Workspace and its Namespaces; a Role only its Namespace.
+SCOPE_REACH = {
+    "global": {"global", "cluster", "workspace", "namespace"},
+    "cluster": {"cluster", "workspace", "namespace"},
+    "workspace": {"workspace", "namespace"},
+    "namespace": {"namespace"},
+}
+
+# Template scopes reachable from a request scope. A cluster-scope template
+# authorizes namespaced requests because its rules apply cluster-wide.
+TEMPLATE_SCOPE_CHILDREN = {
+    "cluster": {"cluster", "workspace", "namespace"},
+    "workspace": {"workspace", "namespace"},
+    "namespace": {"namespace"},
+}
+
+
 def role_scope(role: str) -> str:
+    model = BUILTIN_ROLES.get(role)
+    if model:
+        return str(model["scope"])
     if role.startswith("cluster-"):
         return "cluster"
     if role.startswith("workspace-"):
@@ -1053,38 +1230,111 @@ def role_scope(role: str) -> str:
     return ""
 
 
+def identity_roles(role: str) -> list[str]:
+    """Builtin roles that apply to the identity behind `role`.
+
+    Every logged-in user also carries the `authenticated` GlobalRole, and an
+    unauthenticated request is authenticated as `system:anonymous`, which
+    carries the `anonymous` GlobalRole.
+    """
+    if role == "no-token":
+        return ["anonymous"]
+    if role in ("authenticated", "no-permission"):
+        return ["authenticated"]
+    return ["authenticated", role]
+
+
 def template_applies(template: dict[str, Any], role: str) -> bool:
+    """Whether a RoleTemplate is aggregated into the builtin `role`.
+
+    Both the roleSelector labels and the scope label of the RoleTemplate must
+    match. There is no `aggregate-to-cluster-admin` or
+    `aggregate-to-platform-admin` label: those roles aggregate every template
+    whose scope matches.
+    """
+    model = BUILTIN_ROLES.get(role)
+    if not model:
+        return False
+    selector = model.get("selector")
+    if selector is None:
+        return False
     labels = nested(template, "metadata", "labels", default={}) or {}
-    scope = labels.get("iam.kubesphere.io/scope", "")
-    if "iam.kubesphere.io/aggregate-to-authenticated" in labels:
-        return role != "no-token"
-    if role in ("authenticated", "no-permission", "no-token"):
+    if labels.get(SCOPE_LABEL, "") != model["scope"]:
         return False
-    if role_scope(role) != scope:
-        return False
-    if role in ("workspace-admin", "namespace-admin"):
-        return True
-    label_by_role = {
-        "cluster-admin": "iam.kubesphere.io/aggregate-to-cluster-admin",
-        "cluster-viewer": "iam.kubesphere.io/aggregate-to-cluster-viewer",
-        "workspace-viewer": "iam.kubesphere.io/aggregate-to-viewer",
-        "namespace-viewer": "iam.kubesphere.io/aggregate-to-viewer",
-        "namespace-operator": "iam.kubesphere.io/aggregate-to-operator",
-        "platform-admin": "iam.kubesphere.io/aggregate-to-platform-admin",
-    }
-    label = label_by_role.get(role)
-    return bool(label and label in labels)
+    return all(labels.get(key) == value for key, value in selector.items())
 
 
 def rule_matches(rule: dict[str, Any], operation: dict[str, Any]) -> bool:
+    if not isinstance(rule, dict):
+        return False
+
     def matches(values: Any, expected: str) -> bool:
         return isinstance(values, list) and ("*" in values or expected in values)
 
-    return (
-        matches(rule.get("apiGroups"), operation["group"])
-        and matches(rule.get("resources"), operation["resource"])
-        and matches(rule.get("verbs"), operation["verb"])
-    )
+    verbs = [str(verb).lower() for verb in rule.get("verbs", []) or []]
+    verb = str(operation.get("verb", "")).lower()
+    if "*" not in verbs and verb not in verbs:
+        return False
+
+    non_resource_urls = rule.get("nonResourceURLs")
+    if non_resource_urls is not None:
+        path = str(operation.get("nonResourcePath", ""))
+        if not path:
+            return False
+        return any(
+            url == "*" or path == url or (str(url).endswith("*") and path.startswith(str(url)[:-1]))
+            for url in non_resource_urls
+        )
+
+    group = str(operation.get("group", ""))
+    resource = str(operation.get("resource", ""))
+    if not (matches(rule.get("apiGroups"), group) and matches(rule.get("resources"), resource)):
+        return False
+
+    resource_names = rule.get("resourceNames")
+    if resource_names:
+        # resourceNames cannot authorize a request that does not name a resource
+        # (for example list or create), so an unnamed operation never matches.
+        name = str(operation.get("resourceName", ""))
+        if not name or name not in resource_names:
+            return False
+    return True
+
+
+def rego_decision(identity: str, operation: dict[str, Any]) -> str:
+    """Evaluate the builtin `iam.kubesphere.io/rego-override` for known cases.
+
+    `allow` means the Rego policy grants the request, `deny` means it does not,
+    and `uncertain` means the decision depends on request attributes that are
+    not available offline (for example whether a user reads their own record).
+    """
+    if identity == "platform-admin":
+        # The platform-admin Rego override allows every scope it lists and adds
+        # nothing to the role's own `*` rules.
+        return "allow"
+    if identity != "authenticated":
+        return "deny"
+    group = str(operation.get("group", ""))
+    resource = str(operation.get("resource", ""))
+    verb = str(operation.get("verb", "")).lower()
+    path = str(operation.get("path", ""))
+    if resource == "users":
+        # The authenticated Rego override allows every verb on the caller's own
+        # user record; it does not restrict self-service to get/list/watch.
+        return "uncertain"
+    if resource in ("clustermembers", "workspacemembers", "namespacemembers") and verb in (
+        "get",
+        "list",
+        "watch",
+    ):
+        # Member self-service rules compare input.User.Name with the requested
+        # subject and are limited to read verbs.
+        return "uncertain"
+    if group == "tenant.kubesphere.io" and verb in ("get", "list", "watch") and path.startswith("/kapis/"):
+        return "allow"
+    if path in ("/api", "/api/v1") and verb == "get":
+        return "allow"
+    return "deny"
 
 
 def relation_allowed(role: str, operation_scope: str, target: str) -> bool:
@@ -1107,35 +1357,65 @@ def operation_targets(operation: dict[str, Any]) -> list[str]:
     return ["cluster"]
 
 
+def expected_decision(
+    templates: list[dict[str, Any]],
+    role: str,
+    operation: dict[str, Any],
+    target: str = "own",
+) -> tuple[str, list[str], str]:
+    """Return (ALLOW|DENY|UNVERIFIED, sources, reason) for one matrix row."""
+    if target != "cluster" and not relation_allowed(role, str(operation.get("scope", "")), target):
+        return "DENY", [], "binding scope does not reach the target"
+    request_scope = str(operation.get("scope", ""))
+    sources: list[str] = []
+    uncertain = False
+    for identity in identity_roles(role):
+        model = BUILTIN_ROLES.get(identity)
+        if model is None:
+            continue
+        if request_scope and request_scope not in SCOPE_REACH.get(str(model["scope"]), {request_scope}):
+            continue
+        if any(rule_matches(rule, operation) for rule in model.get("rules", [])):
+            sources.append(f"builtin:{identity}")
+        if model.get("selector") is not None:
+            for template in templates:
+                if not template_applies(template, identity):
+                    continue
+                template_scope = str(nested(template, "metadata", "labels", SCOPE_LABEL, default=""))
+                if (
+                    request_scope
+                    and template_scope not in ("", "global")
+                    and request_scope not in TEMPLATE_SCOPE_CHILDREN.get(template_scope, {template_scope})
+                ):
+                    continue
+                rules = nested(template, "spec", "rules", default=[]) or []
+                if any(rule_matches(rule, operation) for rule in rules if isinstance(rule, dict)):
+                    sources.append(str(nested(template, "metadata", "name", default="<unnamed>")))
+        rego = rego_decision(identity, operation)
+        if rego == "allow":
+            sources.append(f"rego:{identity}")
+        elif rego == "uncertain":
+            uncertain = True
+    sources = list(dict.fromkeys(sources))
+    if sources:
+        return "ALLOW", sources, ""
+    if uncertain:
+        return (
+            "UNVERIFIED",
+            [],
+            "Rego override depends on the calling user or subject and cannot be evaluated offline",
+        )
+    return "DENY", [], ""
+
+
 def expected_allow(
     templates: list[dict[str, Any]],
     role: str,
     operation: dict[str, Any],
     target: str = "own",
 ) -> tuple[bool, list[str]]:
-    if target != "cluster" and not relation_allowed(role, str(operation.get("scope", "")), target):
-        return False, []
-    names: list[str] = []
-    scope_children = {
-        "cluster": {"cluster", "workspace", "namespace"},
-        "workspace": {"workspace", "namespace"},
-        "namespace": {"namespace"},
-    }
-    for template in templates:
-        if not template_applies(template, role):
-            continue
-        template_scope = str(nested(template, "metadata", "labels", "iam.kubesphere.io/scope", default=""))
-        operation_scope = str(operation.get("scope", ""))
-        if (
-            operation_scope
-            and template_scope not in ("", "global")
-            and operation_scope not in scope_children.get(template_scope, {template_scope})
-        ):
-            continue
-        rules = nested(template, "spec", "rules", default=[]) or []
-        if any(rule_matches(rule, operation) for rule in rules if isinstance(rule, dict)):
-            names.append(str(nested(template, "metadata", "name", default="<unnamed>")))
-    return bool(names), names
+    decision, sources, _ = expected_decision(templates, role, operation, target)
+    return decision == "ALLOW", sources
 
 
 def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
@@ -1145,7 +1425,7 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
     for operation in operations:
         fixture = fixture_for(scenarios, operation)
         sar = fixture.get("sar", {}) if fixture else {}
-        for key in ("group", "version", "resource", "verb", "scope"):
+        for key in ("group", "version", "resource", "verb", "scope", "nonResourcePath", "resourceName"):
             if key in sar:
                 operation[key] = str(sar[key])
         if fixture and fixture.get("requestPath"):
@@ -1157,7 +1437,7 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
     for operation in operations:
         for role in roles:
             for target in operation_targets(operation):
-                allow, sources = expected_allow(templates, role, operation, target)
+                decision, sources, reason = expected_decision(templates, role, operation, target)
                 matrix.append(
                     {
                         "role": role,
@@ -1166,8 +1446,21 @@ def build_plan(path: Path, config: dict[str, Any]) -> dict[str, Any]:
                         "operationKey": operation["operationKey"],
                         "method": operation["method"],
                         "path": operation["path"],
-                        "sar": {key: operation[key] for key in ("group", "version", "resource", "verb", "scope")},
-                        "expected": "ALLOW" if allow else "DENY",
+                        "sar": {
+                            key: operation[key]
+                            for key in (
+                                "group",
+                                "version",
+                                "resource",
+                                "verb",
+                                "scope",
+                                "nonResourcePath",
+                                "resourceName",
+                            )
+                            if key in operation
+                        },
+                        "expected": decision,
+                        "expectedReason": reason,
                         "roleTemplates": sources,
                         "evidence": operation.get("evidence", []),
                     }
@@ -2014,10 +2307,6 @@ def compare_aggregations(
             str(nested(template, "metadata", "name", default=""))
             for template in templates
             if template_applies(template, role)
-            and (
-                role == "authenticated"
-                or nested(template, "metadata", "labels", "iam.kubesphere.io/scope", default="") != "global"
-            )
         )
         response = admin.request("GET", path)
         actual: list[str] = []
@@ -2147,13 +2436,19 @@ def register_cleanup(state: dict[str, Any], cleanup: Any, variables: dict[str, A
 
 def scenario_operation(scenario: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     authorization = scenario.get("authorization", {}) or {}
-    return {
+    operation = {
         "group": str(authorization.get("group", "")),
         "version": str(authorization.get("version", "")),
         "resource": str(authorization.get("resource", "")),
         "verb": str(authorization.get("verb", VERBS.get(str(request.get("method", "")).lower(), ""))),
         "scope": str(authorization.get("scope", "cluster")),
     }
+    # Non-resource and named-resource requests need attributes that the generic
+    # group/resource/verb triple cannot express.
+    for key in ("nonResourcePath", "resourceName"):
+        if key in authorization:
+            operation[key] = str(authorization[key])
+    return operation
 
 
 def execute_scenarios(
@@ -2313,12 +2608,14 @@ def execute_scenarios(
         statuses = expected.get("statuses")
         if statuses:
             functional = response.status in statuses
-        elif actor == "no-token":
-            functional = response.status in (401, 403)
         elif authorization == "DENY":
             functional = response.status == 403
         else:
             functional = 200 <= response.status < 300
+        # An explicit `statuses` list describes business responses for an
+        # authorized caller; it must never turn a DENY bypass into PASS.
+        if authorization == "DENY" and response.status != 403:
+            functional = False
         assertion_error = check_assertions(response.body, scenario) if functional else ""
         capture_error = capture_values(response.body, scenario.get("capture", {}) or {}, variables) if functional else ""
         error = assertion_error or capture_error
@@ -2328,6 +2625,14 @@ def execute_scenarios(
         if required_error_terms:
             diagnostic = all(term in response.body.lower() for term in required_error_terms)
         layer, suggestion = diagnose(authorization, response, error, diagnostic)
+        if actor == "no-token" and response.status == 401:
+            layer = "authentication"
+            suggestion = (
+                "ks-apiserver returned 401 to a request without Authorization; a missing token is "
+                "authenticated as system:anonymous and must be denied by RBAC with 403. Verify the URL "
+                "targets ks-apiserver (not Console), anonymous authentication is enabled, and the route "
+                "is not excluded from RBAC"
+            )
         if scenario.get("cleanup"):
             register_cleanup(state, scenario["cleanup"], variables)
             save_state(state_file(config_path, config, state["runID"]), state)
@@ -2393,6 +2698,16 @@ def execute_matrix(
         request_operation = {**operation, "path": operation.get("requestPath", operation["path"])}
         can_run, reason = executable_case(request_operation, resolved_fixture, row_variables)
         result = {**row, "functionalPassed": False, "diagnosticPassed": True, "passed": False}
+        if row.get("expected") == "UNVERIFIED":
+            result.update(
+                {
+                    "result": "NOT_TESTED",
+                    "skipped": True,
+                    "skipReason": row.get("expectedReason", "expectation cannot be derived offline"),
+                }
+            )
+            results.append(result)
+            continue
         if not can_run:
             result.update({"result": "NOT_TESTED", "skipped": True, "skipReason": reason})
             results.append(result)
@@ -2417,9 +2732,7 @@ def execute_matrix(
             result["actualStatus"] = response.status
             result["requestID"] = response.headers.get("Audit-Id") or response.headers.get("X-Request-ID") or response.headers.get("X-Trace-ID") or ""
             result["response"] = summarize(response.body)
-            if row["role"] == "no-token":
-                functional = response.status == 401
-            elif row["expected"] == "ALLOW":
+            if row["expected"] == "ALLOW":
                 successes = resolved_fixture.get("expectedSuccess", []) if resolved_fixture else []
                 functional = response.status in successes if successes else 200 <= response.status < 300
             else:
@@ -2436,6 +2749,14 @@ def execute_matrix(
         else:
             functional = diagnostic = False
         layer, suggestion = diagnose(row["expected"], response, error, diagnostic)
+        if row["role"] == "no-token" and response is not None and response.status == 401:
+            layer = "authentication"
+            suggestion = (
+                "ks-apiserver returned 401 to a request without Authorization; a missing token is "
+                "authenticated as system:anonymous and must be denied by RBAC with 403. Verify the URL "
+                "targets ks-apiserver (not Console), anonymous authentication is enabled, and the route "
+                "is not excluded from RBAC"
+            )
         result.update(
             {
                 "functionalPassed": functional,

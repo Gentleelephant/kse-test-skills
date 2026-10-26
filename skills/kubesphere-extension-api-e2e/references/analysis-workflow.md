@@ -32,18 +32,33 @@ Record whether a mapping came from the API document or configuration.
 
 ## Role And Scope Expansion
 
-Match operations against applicable RoleTemplate rules and aggregation labels.
-Generate:
+Match operations against the builtin role's own rules and the RoleTemplates it
+aggregates. Generate:
 
 - one cluster target for cluster APIs;
 - own and other Workspace targets for Workspace APIs;
 - own Namespace, sibling Namespace, and other Workspace Namespace targets for
   Namespace APIs.
 
-Cluster roles apply across targets. Workspace roles apply to their Workspace
-and its Namespaces. Namespace roles apply only to their invited Namespace.
-Authenticated RoleTemplates apply to logged-in users; no-token never inherits
-them.
+Expectation rules:
+
+- Every logged-in user also carries the `authenticated` GlobalRole, so both
+  `authenticated` rules and the bound role determine ALLOW.
+- No-token requests carry only the `anonymous` GlobalRole. That role allows
+  only `config.kubesphere.io/configs` get/list and `/static/images/*` GET; every
+  other extension API is DENY.
+- `cluster-admin`, `workspace-admin`, `namespace-admin`, and `platform-admin`
+  carry their own wildcard rules. They allow matching requests even when no
+  RoleTemplate is aggregated.
+- An aggregation selector always includes `iam.kubesphere.io/scope` equal to the
+  role scope. Namespace roles (`admin`/`operator`/`viewer`) additionally require
+  `kubesphere.io/managed: "true"`. There is no `aggregate-to-cluster-admin` or
+  `aggregate-to-platform-admin` label; those roles use an empty selector.
+- Cluster roles apply across targets. Workspace roles apply to their Workspace
+  and its Namespaces. Namespace roles apply only to their invited Namespace.
+- The `authenticated` GlobalRole Rego override depends on the caller's subject
+  for self-service `users`, `clustermembers`, `workspacemembers`, and
+  `namespacemembers` requests. Those rows are `UNVERIFIED`; do not guess.
 
 ## Membership Setup
 
@@ -60,9 +75,10 @@ the binding does not become ready before `membershipWait`.
 
 ## Result Classification
 
-- no-token 401: PASS;
+- no-token expected DENY 403: PASS;
 - authenticated expected DENY 403: PASS;
 - expected DENY 2xx: authorization bypass;
+- no-token (or any request) 401: authentication failure, never expected denial;
 - expected ALLOW 401: authentication or Token failure;
 - expected ALLOW 403: RoleTemplate aggregation, invitation, binding, or API
   authorization mismatch;

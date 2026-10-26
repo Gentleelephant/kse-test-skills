@@ -38,7 +38,10 @@ scenarios:
 ```
 
 Select by `operationId`, or by exact `method` and `path`. `requestPath` may
-correct only the runtime URL.
+correct only the runtime URL. `sar` also accepts `nonResourcePath` (for
+`nonResourceURLs` rules) and `resourceName` (for `resourceNames` rules); both
+are required for those rules to match, because the generic group/resource/verb
+triple cannot express them.
 
 ## Additional Scenarios
 
@@ -83,7 +86,8 @@ Use a generic scenario for dependencies and business behavior:
 ```
 
 `authorization: ALLOW` means IAM permits the request even when business
-validation is expected to reject it. Use `DENY` only for authorization denial.
+validation is expected to reject it. Use `DENY` only for authorization denial;
+`statuses` never relaxes it, so a `DENY` row must still return 403.
 
 ## Steps, Variables, And Cleanup
 
