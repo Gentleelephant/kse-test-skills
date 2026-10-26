@@ -36,7 +36,9 @@ kubectl --context "$CONTEXT" api-resources | grep -i '<group-or-resource>'
    - expected deny + actual `403`: pass.
    - expected allow + actual `403`: fail; check RoleTemplate aggregation, binding, token, path scope, and cluster/namespace segment.
    - expected deny + actual `2xx`: fail; permission may be too broad or backend authorization may be missing.
-   - `401`: token is missing, expired, malformed, or issued by a different endpoint.
+   - `401`: credentials are present but invalid (expired or malformed Bearer, wrong Basic password, unknown scheme) or the request hit a handler outside RBAC. A request with no `Authorization` header is not a 401: it becomes `system:anonymous` and is denied with `403`.
+   - no-token control returning `403`: expected. `403` from RBAC is the same for anonymous and authenticated denials.
+   - no-token control returning `401`: fail at the authentication layer; verify the server URL, anonymous authentication, and the RBAC-excluded path list.
    - `404`: verify the path and API discovery first; do not treat it as an authorization result.
    - `409`: object already exists; read it and decide whether it satisfies the test setup.
 8. Produce the standard final report. Keep tokens, passwords, and full secret-bearing request bodies out of the report.
@@ -45,11 +47,23 @@ kubectl --context "$CONTEXT" api-resources | grep -i '<group-or-resource>'
 
 | Status | Meaning | Next check | Authorization evidence |
 | --- | --- | --- | --- |
-| 401 | Missing, expired, malformed, or wrong-endpoint token | Login again and inspect sanitized diagnostics | FAIL for expected ALLOW; otherwise not a denial result |
-| 403 | Authenticated request denied | RoleTemplate, aggregated role, binding, token subject, and scoped path | PASS only for expected DENY |
+| 401 | Invalid credentials: expired, malformed, or wrong-endpoint token; wrong Basic password; unknown scheme. Never "no token" | Login again, check the server URL, and inspect sanitized diagnostics | FAIL for expected ALLOW or a no-token control; not a denial result |
+| 403 | RBAC denied the request, including `system:anonymous` without a token | RoleTemplate, aggregated role, binding, token subject, and scoped path | PASS only for expected DENY |
 | 404 | Route or resource was not found | Discovery, server URL, group/version, cluster prefix, and object name | PARTIAL |
 | 409 | Existing object conflicts with setup | Read it and compare owner, role, scope, and run identity | PARTIAL until resolved |
 | 5xx | Server, gateway, or extension backend failure | ks-apiserver/backend logs, Pods, APIService, and events | PARTIAL or BLOCKED |
+
+### Missing Credentials
+
+A request without an `Authorization` header is not rejected by authentication.
+The authenticator chain returns `system:anonymous` with success, so the request
+reaches authorization and RBAC returns `403`. Only an `anonymous` GlobalRole
+rule (`config.kubesphere.io/configs` get/list, `/static/images/*` GET) can make
+an unauthenticated request pass. `401` means the supplied credentials are
+invalid or the route bypasses RBAC (`/oauth/*`, `/version`, `/kapis/version`,
+`/metrics`, `/healthz`, `/openapi/v2`, `/dist/*`); a few excluded handlers, such
+as OAuth userinfo, return 401 themselves. Never record a no-token 401 as an
+expected denial.
 
 Network timeout and TLS failures are environment failures. Confirm endpoint
 identity before using `--insecure`; do not convert them into authorization
@@ -104,12 +118,13 @@ Conclusion rules:
 - `PASS`: every executed authorization check has a known expectation and matches it.
 - `FAIL`: at least one known expectation is contradicted, such as expected `DENY` but actual `2xx`, or expected `ALLOW` but actual `403`.
 - `PARTIAL`: some useful checks ran, but at least one row cannot be judged as authorization evidence. Common causes are `404` path uncertainty, missing API object prerequisites, incomplete role coverage, or expectation `UNKNOWN`.
-- `BLOCKED`: no meaningful authorization judgment can be made. Common causes are invalid credentials, no token, ks-apiserver unreachable, missing API documentation, or inability to read RoleTemplates.
+- `BLOCKED`: no meaningful authorization judgment can be made. Common causes are invalid credentials, the intended test user cannot obtain a token, ks-apiserver unreachable, missing API documentation, or inability to read RoleTemplates. A deliberate no-token control is a real check, not `BLOCKED`.
 
 Row-level result rules:
 
 - `PASS`: expected `ALLOW` and actual HTTP is `2xx`; expected `DENY` and actual HTTP is `403`.
-- `FAIL`: expected `ALLOW` and actual HTTP is `401` or `403`; expected `DENY` and actual HTTP is `2xx`.
+- `FAIL`: expected `ALLOW` and actual HTTP is `401` or `403`; expected `DENY` and actual HTTP is `2xx`; a no-token control returns `401`.
+- `PASS` for a no-token control requires `403`, the same RBAC denial an authenticated user receives.
 - `PARTIAL`: actual HTTP is `404`, `409`, or `5xx`, or the expected decision is `UNKNOWN`.
 - `BLOCKED`: the row was not executed because setup failed.
 
