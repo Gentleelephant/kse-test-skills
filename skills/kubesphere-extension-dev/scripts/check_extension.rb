@@ -26,6 +26,21 @@ class ExtensionChecker
     clusterInfo
     nodeSelector
   ].freeze
+  # Normalized category names accepted by ksbuilder; unknown values are
+  # reported but not treated as failures because the marketplace may add more.
+  CATEGORIES = %w[
+    ai-machine-learning
+    database
+    observability
+    integration-delivery
+    networking
+    security
+    storage
+    streaming-messaging
+    computing
+    dev-tools
+    uncategorized
+  ].freeze
 
   def initialize(root)
     @root = Pathname.new(root).expand_path
@@ -58,8 +73,7 @@ class ExtensionChecker
 
     pass("extension_yaml.present", "Found extension.yaml")
     required = %w[
-      apiVersion name version displayName description category provider
-      staticFileDirectory icon kubeVersion ksVersion installationMode
+      apiVersion name version displayName description category provider icon
     ]
     required.each do |key|
       value = data[key]
@@ -70,10 +84,21 @@ class ExtensionChecker
       end
     end
 
+    optional = {
+      "staticFileDirectory" => "staticFileDirectory is not set; ksbuilder does not require it, but relative icon and screenshot paths are resolved from the extension root",
+      "kubeVersion" => "kubeVersion is not set; ksbuilder does not require it, but cluster compatibility is then unconstrained",
+      "ksVersion" => "ksVersion is not set; ksbuilder does not require it, but KubeSphere compatibility is then unconstrained",
+      "installationMode" => "installationMode is not set; ksbuilder defaults it to HostOnly"
+    }
+    optional.each do |key, message|
+      warn("extension_yaml.#{key}.missing", message) if blank?(data[key])
+    end
+
     check_name(data["name"])
     check_version(data["version"])
     check_i18n("displayName", data["displayName"])
     check_i18n("description", data["description"])
+    check_category(data["category"])
     check_provider(data["provider"])
     check_static_files(data)
     check_charts_and_dependencies(data)
@@ -115,6 +140,22 @@ class ExtensionChecker
     warn("extension_yaml.#{field}.zh", "#{field} should include zh text for Chinese environments") if blank?(value["zh"])
   end
 
+  def check_category(category)
+    return if blank?(category)
+
+    values = Array(category).map(&:to_s)
+    unknown = values.reject { |value| CATEGORIES.include?(value) }
+    if unknown.empty?
+      pass("extension_yaml.category.known", "Category is recognized by ksbuilder: #{values.join(', ')}")
+    else
+      warn(
+        "extension_yaml.category.unknown",
+        "Category is not in the ksbuilder normalized set (#{CATEGORIES.join(', ')}): " \
+        "#{unknown.join(', ')}; ksbuilder may map it to uncategorized"
+      )
+    end
+  end
+
   def check_provider(provider)
     unless provider.is_a?(Hash)
       warn("extension_yaml.provider.shape", "provider should include localized provider metadata")
@@ -146,9 +187,25 @@ class ExtensionChecker
 
   def check_relative_file(code, value)
     return if blank?(value)
-    return warn(code, "Remote URL not checked: #{value}") if value.to_s.match?(%r{\Ahttps?://})
 
-    rel = value.to_s.sub(%r{\A\./}, "")
+    string = value.to_s
+    return warn(code, "Remote URL not checked: #{string}") if string.match?(%r{\Ahttps?://})
+
+    # ksbuilder treats data:image sources as embedded and never reads them as
+    # local files. Other data: URIs fall through to the file check, because
+    # ksbuilder opens them as literal paths and fails when the file is absent.
+    if string.start_with?("data:image")
+      pass("#{code}.embedded", "Embedded data:image URI is accepted without file checks")
+      return
+    end
+    if string.start_with?("data:")
+      warn(
+        "#{code}.embedded",
+        "Only data:image URIs are embedded in ksbuilder; this value is checked as a local path: #{string[0, 32]}",
+      )
+    end
+
+    rel = string.sub(%r{\A\./}, "")
     path = @root.join(rel)
     if path.file?
       pass("#{code}.exists", "Referenced file exists: #{rel}")
@@ -219,12 +276,11 @@ class ExtensionChecker
     case installation_mode
     when "Multicluster"
       warn("installationMode.multicluster.agent", "Multicluster extension should normally have at least one agent dependency") unless all_tags.include?("agent")
-    when "HostOnly"
+    when "HostOnly", nil
+      # ksbuilder defaults a missing value to HostOnly.
       warn("installationMode.hostonly.agent", "HostOnly extension has agent dependency tag; confirm this is intentional") if all_tags.include?("agent")
-    when nil
-      # Already reported as required field.
     else
-      fail_check("installationMode.value", "installationMode should be HostOnly or Multicluster, got #{installation_mode.inspect}")
+      warn("installationMode.value", "installationMode should be HostOnly or Multicluster, got #{installation_mode.inspect}; ksbuilder accepts it but the installplan controller does not read this field")
     end
   end
 
