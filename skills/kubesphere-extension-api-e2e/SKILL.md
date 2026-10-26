@@ -51,7 +51,9 @@ If configuration is absent, stop before cluster access and run `init`.
    Errors are categorized as `CONFIGURATION_ERROR`, `ENVIRONMENT_ERROR`, or
    `CLUSTER_ERROR`.
 3. **Plan** maps every operation to group/version/resource/verb/scope, records
-   mapping evidence, and derives ALLOW/DENY only from RoleTemplates.
+   mapping evidence, and derives ALLOW/DENY from the builtin role rules plus
+   the RoleTemplates those roles aggregate. Rows whose outcome depends on
+   request identity (Rego self-service rules) are `UNVERIFIED`, not guessed.
 4. Review unresolved mappings, source/live RoleTemplate drift, roles, own and
    cross-scope targets, and write fixtures. Add `apiMappings` only when needed.
 5. **Run** with explicit `--execute`. The runner creates temporary users,
@@ -73,7 +75,11 @@ with `alreadyClean: true`.
 - Every documented operation appears in the plan and result.
 - Own, sibling Namespace, other Workspace, authenticated/no-permission, and
   no-token controls are covered as applicable.
-- No-token returns 401; authenticated denial returns 403.
+- No-token denial returns 403, exactly like an authenticated denial. A
+  request without `Authorization` is authenticated as `system:anonymous` and
+  fails RBAC; 401 means the request never reached the RBAC layer.
+- Unauthenticated requests are allowed only by the `anonymous` GlobalRole
+  rules (`config.kubesphere.io/configs` get/list, `/static/images/*` GET).
 - Writes without valid fixtures are `NOT_TESTED`, never PASS.
 - Setup failures are `SETUP_BLOCKED`, not extension authorization failures.
 - Cleanup has no errors or unexplained residual resources.
@@ -89,6 +95,10 @@ with `alreadyClean: true`.
 - Member API failure: verify KubeSphere v1beta1 IAM member endpoints.
 - Cluster not ready: stop before resource creation to avoid finalizer cleanup issues.
 - Binding timeout: inspect invitation, roleRef, scope labels, user subject, and aggregation.
+- No-token request returns 401 instead of 403: confirm the URL targets
+  ks-apiserver (not Console), anonymous authentication is enabled, and the
+  route is not on the RBAC-excluded path list. Treat it as an
+  authentication-layer defect, not as expected denial.
 - Interrupted run: use the recorded run ID with `cleanup --execute`.
 
 Every failure must state what failed, impact, next check, and recovery.

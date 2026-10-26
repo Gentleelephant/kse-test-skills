@@ -190,7 +190,10 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(e2e.expected_allow(templates, "workspace-viewer", list_operation)[0])
         self.assertFalse(e2e.expected_allow(templates, "workspace-viewer", create_operation)[0])
         self.assertTrue(e2e.expected_allow(templates, "workspace-admin", create_operation)[0])
-        self.assertFalse(e2e.expected_allow(templates, "cluster-admin", create_operation)[0])
+        # cluster-admin carries its own `*/*/*` rules and aggregates every
+        # cluster-scope template, so it allows the request without a template.
+        self.assertTrue(e2e.expected_allow(templates, "cluster-admin", create_operation)[0])
+        self.assertFalse(e2e.template_applies(templates[0], "cluster-admin"))
 
     def test_roletemplate_scope_must_match_request_scope(self) -> None:
         template = roletemplate(
@@ -315,6 +318,121 @@ class RunnerTests(unittest.TestCase):
         operation = {"group": "example.io", "resource": "widgets", "verb": "get"}
         self.assertTrue(e2e.expected_allow([template], "no-permission", operation)[0])
         self.assertFalse(e2e.expected_allow([template], "no-token", operation)[0])
+
+    def test_builtin_rules_authorize_without_extension_templates(self) -> None:
+        create_operation = {"group": "example.io", "resource": "widgets", "verb": "create"}
+        list_namespaced = {
+            "group": "example.io",
+            "resource": "widgets",
+            "verb": "list",
+            "scope": "namespace",
+        }
+        decisions = {
+            ("cluster-admin", "cluster"): "ALLOW",
+            ("platform-admin", "cluster"): "ALLOW",
+            ("cluster-viewer", "cluster"): "DENY",
+            ("workspace-viewer", "own"): "DENY",
+            ("namespace-viewer", "own"): "DENY",
+        }
+        for (role, target), expected in decisions.items():
+            with self.subTest(role=role):
+                self.assertEqual(
+                    e2e.expected_decision([], role, create_operation, target)[0],
+                    expected,
+                )
+        self.assertEqual(e2e.expected_decision([], "workspace-admin", create_operation, "own")[0], "ALLOW")
+        self.assertEqual(
+            e2e.expected_decision([], "workspace-admin", create_operation, "other-workspace")[0],
+            "DENY",
+        )
+        # `namespace-viewer` grants get/list/watch from its own rules.
+        self.assertEqual(e2e.expected_decision([], "namespace-viewer", list_namespaced)[0], "ALLOW")
+
+    def test_aggregation_selector_matches_role_scope(self) -> None:
+        cluster_template = roletemplate("cluster-manage-widgets", "cluster", [], ["create"])
+        workspace_template = roletemplate("workspace-manage-widgets", "workspace", [], ["create"])
+        self.assertTrue(e2e.template_applies(cluster_template, "cluster-admin"))
+        self.assertFalse(e2e.template_applies(workspace_template, "cluster-admin"))
+        self.assertTrue(e2e.template_applies(workspace_template, "workspace-admin"))
+        # No aggregate-to-cluster-admin label exists, but any cluster template
+        # is aggregated; platform-admin only aggregates global templates.
+        self.assertFalse(e2e.template_applies(cluster_template, "platform-admin"))
+        self.assertFalse(e2e.template_applies(cluster_template, "cluster-viewer"))
+
+    def test_namespace_roles_require_managed_label(self) -> None:
+        operation = {
+            "group": "example.io",
+            "resource": "widgets",
+            "verb": "create",
+            "scope": "namespace",
+        }
+        unmanaged = roletemplate(
+            "view-widgets", "namespace", ["iam.kubesphere.io/aggregate-to-viewer"], ["create"]
+        )
+        managed = roletemplate(
+            "view-widgets", "namespace", ["iam.kubesphere.io/aggregate-to-viewer"], ["create"]
+        )
+        managed["metadata"]["labels"]["kubesphere.io/managed"] = "true"
+        self.assertFalse(e2e.expected_allow([unmanaged], "namespace-viewer", operation)[0])
+        self.assertTrue(e2e.expected_allow([managed], "namespace-viewer", operation)[0])
+
+    def test_rule_matches_honors_non_resource_urls_and_resource_names(self) -> None:
+        non_resource = {"nonResourceURLs": ["/metrics"], "verbs": ["get"]}
+        self.assertTrue(e2e.rule_matches(non_resource, {"verb": "get", "nonResourcePath": "/metrics"}))
+        self.assertFalse(e2e.rule_matches(non_resource, {"verb": "get", "nonResourcePath": "/api"}))
+        self.assertFalse(e2e.rule_matches(non_resource, {"group": "", "resource": "pods", "verb": "get"}))
+        named = {
+            "apiGroups": [""],
+            "resources": ["nodes"],
+            "resourceNames": ["node-a"],
+            "verbs": ["get"],
+        }
+        self.assertTrue(
+            e2e.rule_matches(
+                named,
+                {"group": "", "resource": "nodes", "verb": "get", "resourceName": "node-a"},
+            )
+        )
+        self.assertFalse(
+            e2e.rule_matches(
+                named,
+                {"group": "", "resource": "nodes", "verb": "get", "resourceName": "node-b"},
+            )
+        )
+        self.assertFalse(e2e.rule_matches(named, {"group": "", "resource": "nodes", "verb": "list"}))
+
+    def test_self_service_rego_expectation_is_unverified(self) -> None:
+        # The authenticated Rego override allows any verb on the caller's own
+        # user record, not only get/list/watch.
+        for verb in ("get", "update", "patch", "delete"):
+            operation = {
+                "group": "iam.kubesphere.io",
+                "resource": "users",
+                "verb": verb,
+                "scope": "global",
+            }
+            decision, sources, reason = e2e.expected_decision([], "no-permission", operation)
+            self.assertEqual(decision, "UNVERIFIED", verb)
+            self.assertEqual(sources, [])
+            self.assertIn("Rego", reason)
+
+    def test_scenario_operation_carries_non_resource_and_named_resource_attributes(self) -> None:
+        operation = e2e.scenario_operation(
+            {
+                "authorization": {
+                    "group": "",
+                    "version": "v1",
+                    "resource": "",
+                    "verb": "get",
+                    "scope": "cluster",
+                    "nonResourcePath": "/metrics",
+                    "resourceName": "node-a",
+                }
+            },
+            {"method": "GET"},
+        )
+        self.assertEqual(operation["nonResourcePath"], "/metrics")
+        self.assertEqual(operation["resourceName"], "node-a")
 
     def test_redact_hides_configured_and_header_secrets(self) -> None:
         value = {
@@ -696,6 +814,7 @@ class RunnerTests(unittest.TestCase):
             actor.request.side_effect = [
                 e2e.HTTPResponse(400, '{"message":"parent belongs to another workspace"}', {}),
                 e2e.HTTPResponse(200, '{"items":[]}', {}),
+                e2e.HTTPResponse(200, '{"items":[]}', {}),
             ]
             base = {
                 "actor": "workspace-admin",
@@ -728,6 +847,12 @@ class RunnerTests(unittest.TestCase):
                         "request": {"method": "POST", "path": "/other/widgets", "body": {}},
                         "expect": {"authorization": "DENY", "statuses": [403]},
                     },
+                    {
+                        **base,
+                        "id": "deny-cannot-pass-with-listed-status",
+                        "request": {"method": "POST", "path": "/other/widgets", "body": {}},
+                        "expect": {"authorization": "DENY", "statuses": [200]},
+                    },
                 ]
             }
             results = e2e.execute_scenarios(
@@ -741,6 +866,9 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(results[0]["result"], "PASS")
             self.assertEqual(results[1]["result"], "FAIL")
             self.assertEqual(results[1]["likelyFailureLayer"], "authorization bypass")
+            # An explicit `statuses` list must not turn a DENY bypass into PASS.
+            self.assertEqual(results[2]["result"], "FAIL")
+            self.assertEqual(results[2]["likelyFailureLayer"], "authorization bypass")
 
     def test_workspace_and_namespace_routes_expand_to_cross_scope_targets(self) -> None:
         self.assertEqual(
@@ -930,7 +1058,7 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(e2e.E2EError, "SETUP_BLOCKED.*expected Workspace ownership"):
             e2e.wait_namespaces(admin, {"namespace-a1": "workspace-a"}, 0)
 
-    def test_no_token_requires_401_not_403(self) -> None:
+    def test_no_token_denial_is_403_not_401(self) -> None:
         operation = {
             "operationKey": "GET /kapis/example.io/v1/widgets",
             "method": "GET",
@@ -974,7 +1102,7 @@ class RunnerTests(unittest.TestCase):
             state,
             {"no-token": client},
         )
-        self.assertEqual(results[0]["result"], "FAIL")
+        self.assertEqual(results[0]["result"], "PASS")
         client.request.return_value = e2e.HTTPResponse(
             401,
             '{"message":"Unauthorized: token is required"}',
@@ -987,7 +1115,8 @@ class RunnerTests(unittest.TestCase):
             state,
             {"no-token": client},
         )
-        self.assertEqual(results[0]["result"], "PASS")
+        self.assertEqual(results[0]["result"], "FAIL")
+        self.assertEqual(results[0]["likelyFailureLayer"], "authentication")
 
     def test_cleanup_runs_in_reverse_registration_order(self) -> None:
         admin = mock.Mock()

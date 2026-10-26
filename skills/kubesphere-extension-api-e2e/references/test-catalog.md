@@ -18,7 +18,7 @@ Every complete run covers:
 - namespace-admin, namespace-operator, and namespace-viewer;
 - authenticated/no-permission and no-token controls;
 - own scope and cross-scope behavior;
-- 401 unauthenticated versus 403 authenticated denial;
+- 403 for both anonymous and authenticated denial (401 is never a denial);
 - cleanup recovery by run ID.
 
 ## Scope Matrix
@@ -37,11 +37,16 @@ Workspace role.
 
 ## Result Rules
 
-- Matching RoleTemplate rule plus accepted API status: PASS.
-- Missing matching RoleTemplate rule plus 403: PASS.
-- No Token plus 401: PASS.
+- Matching builtin rule or RoleTemplate rule plus accepted API status: PASS.
+- Missing matching rule plus 403: PASS.
+- No Token plus 403: PASS. A missing token is authenticator-approved as
+  `system:anonymous`, so denial comes from RBAC, not authentication.
 - Logged-in denied user plus 403: PASS.
 - Expected deny plus 2xx: high-risk authorization bypass.
+- No Token plus 401: FAIL at the authentication layer. Check that the request
+  targets ks-apiserver, anonymous authentication is enabled, and the route is
+  not excluded from RBAC.
+- Expected `UNVERIFIED` (Rego self-service rules): `NOT_TESTED`, not a guess.
 - Missing request data for a write: `NOT_TESTED`.
 - Role, invitation, binding, or synchronization failure:
   `SETUP_BLOCKED`, not an extension API result.

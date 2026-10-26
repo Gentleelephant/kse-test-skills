@@ -53,7 +53,11 @@ apiMappings:
 ```
 
 Keys may be an operationId or exact `METHOD path`. Every mapping must provide
-all five fields. RoleTemplate rules remain the expected permission source.
+all five fields. Expected permissions come from the builtin role's own rules
+(including the `authenticated` and `anonymous` identities) plus the
+RoleTemplates each role aggregates. Rows that depend on the caller's subject
+through Rego self-service rules are reported as `UNVERIFIED` rather than
+guessed.
 
 ## Temporary Environment
 
