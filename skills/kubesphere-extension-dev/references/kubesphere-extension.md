@@ -335,10 +335,12 @@ install it.`; v0.4.7 prints only the created object lines. Neither creates an
 the applied objects locally.
 
 Install is a separate step. Confirm the console created `InstallPlan <name>`,
-or create one explicitly:
+or follow [Create An InstallPlan Explicitly](install-lifecycle.md#create-an-installplan-explicitly).
+That guarded procedure stops on a failed preflight or existing plan, validates
+the manifest with `kubectl create --dry-run=server`, and uses `kubectl create`
+only for a new plan.
 
 ```bash
-kubectl --kubeconfig /path/to/kubeconfig get installplan <name> -o yaml
 kubectl --kubeconfig /path/to/kubeconfig get installplan <name> \
   -o jsonpath='{.status.state}{" "}{.status.targetNamespace}{" "}{.status.releaseName}{"\n"}'
 kubectl --kubeconfig /path/to/kubeconfig get installplan <name> \

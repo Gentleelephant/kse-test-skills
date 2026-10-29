@@ -73,6 +73,45 @@ when omitted, so always set it. `upgradeStrategy` is stored but the installplan
 controller does not read it; upgrades happen when `spec.extension.version` or
 `spec.config` changes on an installed plan.
 
+## Create An InstallPlan Explicitly
+
+After a successful publish, replace the example name and version in the
+manifest above and save it as `$INSTALLPLAN_FILE`. The manifest values must
+match the variables below. Run this only against the confirmed test cluster:
+
+```bash
+set -e
+
+KUBECONFIG=/path/to/kubeconfig
+EXTENSION_NAME=example
+EXTENSION_VERSION=1.0.0
+INSTALLPLAN_FILE=/path/to/installplan.yaml
+
+kubectl --kubeconfig "$KUBECONFIG" config current-context
+
+# The published resources must exist before installation.
+kubectl --kubeconfig "$KUBECONFIG" get extension "$EXTENSION_NAME"
+kubectl --kubeconfig "$KUBECONFIG" get extensionversion \
+  "${EXTENSION_NAME}-${EXTENSION_VERSION}"
+
+# Never overwrite a plan that may already be installing or installed.
+existing_plan="$(kubectl --kubeconfig "$KUBECONFIG" get installplan \
+  "$EXTENSION_NAME" --ignore-not-found -o name)"
+if [ -n "$existing_plan" ]; then
+  printf 'InstallPlan already exists: %s; inspect it instead of overwriting it.\n' \
+    "$existing_plan" >&2
+else
+  kubectl --kubeconfig "$KUBECONFIG" create --dry-run=server \
+    -f "$INSTALLPLAN_FILE"
+  kubectl --kubeconfig "$KUBECONFIG" create -f "$INSTALLPLAN_FILE"
+fi
+```
+
+`kubectl create` deliberately fails rather than modifying an existing
+`InstallPlan`; if another actor creates the plan between the check and the
+create, inspect that plan instead of retrying with `apply`. After creation, use
+the verification commands below and wait for a terminal state.
+
 Multi-cluster installation is triggered by `spec.clusterScheduling != nil` and
 the host reaching `Installed`, not by the
 `kubesphere.io/installation-mode` annotation. The annotation is extension

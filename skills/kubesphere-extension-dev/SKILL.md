@@ -66,9 +66,14 @@ Follow this order:
 5. **Publish**: run `ksbuilder publish ... --kubeconfig ...` only against the
    confirmed test cluster. This publishes `Extension`, `ExtensionVersion`, and
    the chart ConfigMap; it does not install anything.
-6. **Install**: confirm an `InstallPlan <extension-name>` exists, or create one
-   explicitly. Wait for `status.state` `Installed`/`Upgraded`; a `Preparing`,
-   `Installing`, or `Upgrading` plan is still pending.
+6. **Install**: confirm the published `Extension` and `ExtensionVersion` exist.
+   If no `InstallPlan <extension-name>` exists, save the minimal manifest from
+   `references/install-lifecycle.md`, validate it with
+   `kubectl create --dry-run=server -f ...`, then create it with
+   `kubectl create -f ...`.
+   `create` refuses to overwrite an existing plan. Wait for `status.state`
+   `Installed`/`Upgraded`; a `Preparing`, `Installing`, or `Upgrading` plan is
+   still pending.
 7. **Verify**: inspect InstallPlan conditions, target namespace, release name,
    JSBundle, APIService, Deployment, Service, ConfigMap, Pod readiness, and
    relevant events.
