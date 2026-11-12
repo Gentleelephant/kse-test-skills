@@ -1,0 +1,4 @@
+interface:
+  display_name: "KubeSphere Extension Release"
+  short_description: "Contribute extensions and resume Chart and museum PRs"
+  default_prompt: "Use $kubesphere-extension-release to contribute extension changes or resume a source PR through verified Chart publication and a museum PR for the tracks I specify."
