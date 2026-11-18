@@ -59,7 +59,7 @@ spec:
     version: 1.0.0
   enabled: true
   upgradeStrategy: Manual
-  config: "{}"            # JSON string, not an object
+  config: "{}"            # string (JSON or YAML), not an object
 # optional multi-cluster scheduling:
 #  clusterScheduling:
 #    placement:
@@ -68,10 +68,13 @@ spec:
 #        matchLabels: {env: test}
 ```
 
-`spec.config` is a string containing JSON. `spec.enabled` defaults to false
-when omitted, so always set it. `upgradeStrategy` is stored but the installplan
-controller does not read it; upgrades happen when `spec.extension.version` or
-`spec.config` changes on an installed plan.
+`spec.config` is a string containing JSON or YAML, not an embedded object. The
+InstallPlan webhook parses it with a YAML decoder and trims trailing whitespace
+from every line, so invalid YAML is rejected and a whitespace-only edit is not a
+reliable change. `spec.enabled` defaults to false when omitted, so always set
+it. `upgradeStrategy` is stored but the installplan controller does not read
+it; upgrades happen when `spec.extension.version` or `spec.config` changes on
+an installed plan.
 
 ## Create An InstallPlan Explicitly
 
@@ -143,16 +146,130 @@ appends to `status.stateHistory` (last 10 entries) and updates conditions
 list of cluster scheduling statuses means the agent subcharts are installed in
 member clusters.
 
-Retry semantics:
+### Trigger semantics (KSE v4.2.x)
 
-- `InstallFailed` plus a changed `spec.config` or `spec.extension.version`
-  retries the install (`Installing`, not `Upgrading`).
-- `Installed`/`Upgraded` plus a changed config or version runs `helm upgrade`.
-- `Preparing`, `Installing`, and `Upgrading` are pending; do not issue another
-  mutation. Wait for a terminal state.
-- There is no helm rollback. A failed upgrade leaves `UpgradeFailed`; recover
-  by fixing the config/version and letting the plan upgrade again, or by
-  uninstalling and reinstalling.
+The controller compares two things on every reconcile:
+
+- `configChanged`: FNV hash of the **effective config string** differs from
+  `status.configHash` on the host, or from
+  `status.clusterSchedulingStatuses[<cluster>].configHash` on a member. The
+  effective config is `spec.config` on the host; on a member it is the deep
+  merge of `spec.config` with `spec.clusterScheduling.overrides[<cluster>]`
+  when that override exists.
+- `versionChanged`: `spec.extension.version` differs from `status.version`
+  (host) or from the per-cluster status version.
+
+Which change triggers what depends on the current state:
+
+| Current state | config changed | only version changed | Controller action |
+| --- | --- | --- | --- |
+| `""` | n/a | n/a | first install (`upgrade=false`) |
+| `InstallFailed` | yes | **no** | re-run install (`upgrade=false`) |
+| `Installed` / `Upgraded` | yes | yes | upgrade (`upgrade=true`) |
+| `UpgradeFailed` | yes | **no** | re-run upgrade (`upgrade=true`) |
+| `Preparing` / `Installing` / `Upgrading` | ignored | ignored | pending; do not mutate |
+
+The important asymmetry: **`versionChanged` is only consulted in the
+`Installed`/`Upgraded` state.** In `InstallFailed` or `UpgradeFailed`, changing
+only `spec.extension.version` does nothing; change `spec.config` (or the
+member override) to re-trigger. The InstallPlan webhook trims trailing
+whitespace, so make a real value change rather than a formatting-only edit.
+See the two sections below for executable steps.
+
+There is no helm rollback. A failed upgrade stays `UpgradeFailed` until the
+config changes; otherwise uninstall and reinstall.
+
+## Upgrade An Installed Extension
+
+Prerequisites before touching the InstallPlan:
+
+1. Publish the target version first: `ksbuilder publish` creates
+   `ExtensionVersion <name>-<version>`. The controller resolves the chart by
+   that exact object name. On KSE v4.2 a missing object makes the executor Job
+   fail (`InstallFailed`/`UpgradeFailed`); older builds returned without
+   action. Either way, a version bump to an unpublished version does not work.
+2. Only patch a plan in a terminal state. A plan in `Preparing`, `Installing`,
+   or `Upgrading` ignores spec changes until the executor Job finishes.
+
+From a healthy `Installed`/`Upgraded` plan there are two kinds of changes
+(version and config; a per-cluster override is a config change):
+
+```bash
+# 1) Version upgrade: publish the new ExtensionVersion first, then bump the ref.
+kubectl --kubeconfig "$KUBECONFIG" patch installplan "$NAME" --type merge \
+  -p '{"spec":{"extension":{"name":"example","version":"1.6.0"}}}'
+
+# 2) Config-only upgrade: spec.config is the WHOLE string; patch replaces it.
+#    Keep it valid YAML/JSON and change at least one real value.
+kubectl --kubeconfig "$KUBECONFIG" patch installplan "$NAME" --type merge \
+  -p '{"spec":{"config":"global:\n  imageRegistry: registry.example.com\n"}}'
+
+# 3) Per-cluster values: JSON merge patch adds/replaces one key while keeping
+#    the other overrides and placement. On KSE v4.2 it is deep-merged over spec.config.
+kubectl --kubeconfig "$KUBECONFIG" patch installplan "$NAME" --type merge \
+  -p '{"spec":{"clusterScheduling":{"overrides":{"member-a":"global:\n  imageRegistry: registry.example.com\n"}}}}'
+```
+
+Expect the plan to move `Preparing -> Upgrading -> Installed`, with
+`status.version` equal to the new version (for a version bump), a new
+`status.configHash`, `Upgraded=True` and `Ready=True` conditions, and a new
+entry in `status.stateHistory`. Check members separately with
+`status.clusterSchedulingStatuses`.
+
+Live evidence (KSE v4.2.1, 2026-11-18): `whizard-logging` stayed at version
+`1.5.0` but recorded two `Upgrading -> Installed` cycles on 2026-11-18 — a
+config-only change upgrades without a version bump. `grafana` shows an
+`Upgrading -> Installed` cycle with `Upgraded=True`, `Installed=True`, and
+`Initialized=True`. `cicd-runner-tekton` shows `UpgradeFailed` entries followed
+by `Upgrading -> Installed` and `Upgraded=True`.
+
+Caveats:
+
+- `upgradeStrategy: Manual` (the default) is not read by the controller; it
+  does not gate or trigger upgrades.
+- Host gating still applies: members are reconciled only while the host is in
+  the deployed state. After a host upgrade, verify each
+  `status.clusterSchedulingStatuses[<cluster>]` rather than assuming the agent
+  release was upgraded; some versions stop member reconciliation once the host
+  leaves the deployed state.
+- A version bump also changes the `ExtensionVersion` object looked up by the
+  controller; never delete or replace that object while a plan references it.
+
+## Re-Trigger A Failed Install Or Upgrade
+
+Use this when the executor Job failed and `status.state` is `InstallFailed`
+or `UpgradeFailed`. Patching `spec` is sufficient to re-schedule work: the
+controller watches every InstallPlan update (`For(&corev1alpha1.InstallPlan{})`
+with no event filter), so the patch itself enqueues a reconcile. There is no
+separate "reschedule" annotation or API in the controller, and
+`kubesphere.io/force-delete` is only a stuck-uninstall escape hatch — do not
+use it to retry an install.
+
+1. Capture evidence first: the failing Job and its logs (see Verification
+   Commands), plus `status.conditions` and `status.stateHistory`.
+2. Fix the underlying cause (chart values, image, RBAC, member connectivity).
+3. Make a **real content change** to the config used by the affected target:
+
+```bash
+# Host: InstallFailed or UpgradeFailed -> change spec.config.
+kubectl --kubeconfig "$KUBECONFIG" patch installplan "$NAME" --type merge \
+  -p '{"spec":{"config":"<full config string with the fix applied>"}}'
+
+# One member: change only that cluster's override (merge patch keeps other keys).
+kubectl --kubeconfig "$KUBECONFIG" patch installplan "$NAME" --type merge \
+  -p '{"spec":{"clusterScheduling":{"overrides":{"member-a":"<fixed YAML string>"}}}}'
+
+# Do NOT do only this while failed (v4.2 ignores versionChanged in failed states):
+# kubectl patch installplan "$NAME" --type merge \
+#   -p '{"spec":{"extension":{"version":"1.6.0"}}}'
+```
+
+4. Watch for a fresh `Preparing -> Installing` (from `InstallFailed`) or
+   `Preparing -> Upgrading` (from `UpgradeFailed`) transition. If the state
+   does not change, the config hash did not change — re-check the effective
+   config (including any override merge) and the webhook's whitespace trim.
+5. If the plan is `Preparing`/`Installing`/`Upgrading`, do not patch it; the
+   controller explicitly returns while the executor Job is running.
 
 ## Multi-Cluster Agents
 
@@ -212,8 +329,10 @@ Per-member behavior:
   `global.clusterInfo.name` plus `global.clusterInfo.role` (`host` or
   `member`). Controller image registry and node selector options are appended
   as overrides.
-- The agent receives `spec.clusterScheduling.overrides[<clusterName>]` when
-  present, otherwise `spec.config`.
+- The agent's effective config is `spec.config` plus, on KSE v4.2, a deep
+  merge of `spec.clusterScheduling.overrides[<clusterName>]` when present;
+  older builds used the override string alone. A change to either changes that
+  cluster's `configHash` and re-triggers that agent only.
 - `status.clusterSchedulingStatuses[<clusterName>]` holds an
   `InstallationStatus` with the same fields and states as the host: `state`,
   `configHash`, `targetNamespace`, `releaseName`, `jobName`, `version`,
@@ -368,3 +487,31 @@ output. Distinguish:
 - `enabled: false` (hidden, still running) from uninstalled (release gone).
 - intentional residuals (namespace, helm-executor RBAC) from unexplained
   leftovers.
+
+## Evidence Basis
+
+`INFERRED` from KSE source (local checkout
+`/Users/zhangpeng/GolandProjects/temp/kse`, commit `5e3360f7`,
+`v4.2.0-beta.2-303-g5e3360f79`):
+
+- `pkg/controller/core/installplan_controller.go`: `SetupWithManager` watches
+  `InstallPlan` with no event filter; `syncInstallPlanStatus` and
+  `syncClusterAgentStatus` contain the state-dependent trigger switch;
+  `syncClusterSchedulingStatus` gates on host state `Deployed`;
+  `installOrUpgradeExtension` writes `configHash`, `version`, `releaseName`,
+  and `jobName`; `updateStateAndConditions` maps `Installed`/`Upgraded` to the
+  deployed state and maintains `stateHistory`/conditions.
+- `pkg/controller/core/util.go`: `clusterConfig`, `merge`, `configChanged`,
+  and `versionChanged` define the effective config and change detection.
+- `pkg/controller/core/installplan_webhook.go`: YAML parsing validation and
+  trailing-whitespace trimming in `Default`.
+
+`VERIFIED` from a live KSE v4.2.1 cluster (`ks-apiserver:v4.2.1`, host plus
+member `17-29`) on 2026-11-18: 13 InstallPlans inspected; `cicd-runner-tekton`
+was `Upgraded` with `UpgradeFailed`/`Upgrading`/`Installed` history and
+`Upgraded=True`; `whizard-logging` and `whizard-monitoring` were `Installed`
+with two and one config-only `Upgrading -> Installed` cycles respectively at
+unchanged versions; `grafana` was `Installed` with an `Upgrading -> Installed`
+cycle; `vector` had per-cluster `Installed` statuses with `<name>-agent`
+releases on both `host` and `17-29`. Sanitized evidence is recorded in
+`validation/runs/2026-11-18-kse-v4.2.1-installplan-triggers.md`.

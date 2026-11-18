@@ -350,8 +350,11 @@ kubectl --kubeconfig /path/to/kubeconfig get installplan <name> \
 Wait for `Installed` or `Upgraded`. `Preparing`, `Installing`, and `Upgrading`
 mean the executor Job is still running; inspect
 `-n <targetNamespace> jobs -l kubesphere.io/extension-ref=<name>` and its logs
-instead of re-applying the plan. `InstallFailed` retries automatically after a
-config or version change.
+instead of re-applying the plan. `InstallFailed` re-triggers on a **config**
+change; a version-only patch is ignored in failed states on KSE v4.2. For
+upgrade and retry commands, see
+[Upgrade An Installed Extension](install-lifecycle.md#upgrade-an-installed-extension)
+and [Re-Trigger A Failed Install Or Upgrade](install-lifecycle.md#re-trigger-a-failed-install-or-upgrade).
 
 Capture verification evidence:
 
@@ -457,7 +460,8 @@ each target extension's `extension.yaml`.
   `InstallPlan` means the install step never ran.
 - InstallPlan pending or failed: inspect `status.conditions`,
   `status.stateHistory`, the executor Job in the target namespace, and its
-  logs. `InstallFailed` retries after a config or version change.
+  logs. `InstallFailed`/`UpgradeFailed` re-trigger on a config change, not on a
+  version-only change (v4.2). See `install-lifecycle.md`.
 - InstallPlan will not delete: Helm uninstall is still running or stuck; check
   the executor Job and events before using `kubesphere.io/force-delete`.
 - UI missing after install: inspect `JSBundle`, frontend service, reverse

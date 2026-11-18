@@ -77,7 +77,16 @@ Follow this order:
 7. **Verify**: inspect InstallPlan conditions, target namespace, release name,
    JSBundle, APIService, Deployment, Service, ConfigMap, Pod readiness, and
    relevant events.
-8. **Uninstall**: delete the InstallPlan (or run `ksbuilder unpublish`), wait
+8. **Upgrade**: publish the target `ExtensionVersion` first, then patch
+   `spec.extension.version` and/or `spec.config` (or a cluster override) from
+   a terminal state. From `InstallFailed`/`UpgradeFailed`, a version-only patch
+   does not re-trigger anything: change the config. See the Upgrade and
+   Re-Trigger sections of `references/install-lifecycle.md`.
+9. **Re-trigger failures**: for `InstallFailed`/`UpgradeFailed`, capture the
+   executor Job and logs, fix the cause, make a real content change to the
+   effective config, and wait for a new `Preparing -> Installing`/`Upgrading`
+   transition. Never patch a `Preparing`/`Installing`/`Upgrading` plan.
+10. **Uninstall**: delete the InstallPlan (or run `ksbuilder unpublish`), wait
    for the finalizer to clear, then verify the host and agent releases,
    workloads, services, and generated resources are gone or explicitly
    documented as retained.
@@ -112,6 +121,12 @@ output alone.
   only applies metadata and the chart.
 - InstallPlan stuck in `Preparing`/`Installing`: inspect the executor Job and
   namespace events; do not re-apply the plan.
+- `InstallFailed`/`UpgradeFailed` with no restart: `spec.extension.version`
+  alone is ignored in failed states (v4.2); patch `spec.config` or that
+  cluster's `spec.clusterScheduling.overrides[<cluster>]` to a real new value.
+  Watch for a fresh `Preparing` entry in `status.stateHistory`.
+- Version bump does nothing: the matching `ExtensionVersion <name>-<version>`
+  was not published, or the plan was still pending when patched.
 - InstallPlan will not delete: the `kubesphere.io/installplan-protection`
   finalizer is waiting for Helm uninstall; capture the Job and events before
   considering `kubesphere.io/force-delete`.
@@ -176,8 +191,9 @@ Use the repository `validation/README.md` template for durable cluster evidence.
 - `references/kubesphere-extension.md`: structure, validation, release, publish,
   verification, rollback, and troubleshooting details.
 - `references/install-lifecycle.md`: InstallPlan contract, state machine,
-  naming, enable/disable semantics, multi-cluster agents, uninstall, residuals,
-  and verification.
+  trigger/upgrade and failed-install re-trigger semantics, naming,
+  enable/disable, multi-cluster agents, uninstall, residuals, verification,
+  and evidence basis.
 - `references/routing-and-status-codes.md`: ks-apiserver entry points, filter
   order, JSBundle/APIService/ReverseProxy contracts, 401/403/404/500/502/503/511
   causes, and the diagnosis sequence.
